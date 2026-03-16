@@ -40,6 +40,6 @@ dev = [
 "Source" = "https://github.com/sykchw/syckpt"
 
 [tool.setuptools]
-packages = ["checkpoint"]
+packages = ["syckpt"]
 
 [tool.versioningit]

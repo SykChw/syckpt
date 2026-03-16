@@ -12,16 +12,16 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from checkpoint.config import HyperConfig
-from checkpoint.hash import LSHHashGenerator
-from checkpoint.state import (
+from syckpt.config import HyperConfig
+from syckpt.hash import LSHHashGenerator
+from syckpt.state import (
     StateManager,
     get_rng_state,
     set_rng_state,
     get_deterministic_state,
     set_deterministic_state,
 )
-from checkpoint.storage import CASStorage, flatten_state, unflatten_state
+from syckpt.storage import CASStorage, flatten_state, unflatten_state
 
 logger = logging.getLogger(__name__)
 
