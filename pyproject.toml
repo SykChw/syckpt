@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "versioningit>=2.2.0"]
+requires = ["setuptools>=61.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "syckpt"
-dynamic = ["version"]
+version = "0.0.1"
 description = "Git-like experiment tracking for deep learning with exact computational resumption"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -42,9 +42,3 @@ dev = [
 [tool.setuptools]
 packages = ["syckpt"]
 
-[tool.versioningit]
-
-[tool.versioningit.format]
-distance = "{version}.post{distance}+{vcs}{rev}"
-dirty = "{version}"
-distance-dirty = "{version}.post{distance}+{vcs}{rev}"

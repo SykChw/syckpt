@@ -1,4 +1,4 @@
-# Syckpt 🗂️ v0.0.1
+# Syckpt v0.0.1
 
 **Git-like experiment tracking for deep learning with exact computational resumption, zero-copy safetensors memory-mapping, and delta-compression.**
 
@@ -6,7 +6,7 @@
 
 ---
 
-## 🚀 How `syckpt` Works (The Architecture)
+## How `syckpt` Works (The Architecture)
 
 When training massive Deep Learning models, saving a full checkpoint at every epoch typically results in gigabytes of duplicated disk space and high latency. `syckpt` solves this by treating machine learning checkpoints like a Git repository.
 
@@ -38,8 +38,8 @@ uv pip install syckpt
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from checkpoint import CheckpointManager
-from checkpoint.dataloader import StatefulDataLoader
+from syckpt import CheckpointManager
+from syckpt.dataloader import StatefulDataLoader
 from torch.utils.data import DataLoader, TensorDataset
 
 # Typical PyTorch components
