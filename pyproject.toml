@@ -43,3 +43,8 @@ dev = [
 packages = ["syckpt"]
 
 [tool.versioningit]
+
+[tool.versioningit.format]
+distance = "{version}.post{distance}+{vcs}{rev}"
+dirty = "{version}"
+distance-dirty = "{version}.post{distance}+{vcs}{rev}"
