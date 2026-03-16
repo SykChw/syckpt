@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "versioningit>=2.2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "syckpt"
+dynamic = ["version"]
+description = "Git-like experiment tracking for deep learning with exact computational resumption"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "Sayak Chowdhury", email = "sayak.iiitb@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "numpy>=1.20.0",
+    "safetensors>=0.4.0",
+    "fsspec>=2023.0.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "mypy>=1.0.0",
+    "twine>=4.0.0",
+    "build>=1.0.0"
+]
+
+[project.urls]
+"Bug Reports" = "https://github.com/sykchw/syckpt/issues"
+"Source" = "https://github.com/sykchw/syckpt"
+
+[tool.setuptools]
+packages = ["checkpoint"]
+
+[tool.versioningit]

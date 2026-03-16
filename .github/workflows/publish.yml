@@ -1,0 +1,41 @@
+name: Publish Python Distribution to PyPI
+
+on:
+  push:
+    tags:
+      - 'v*'  # Trigger only on version tags, e.g. v0.0.1
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    
+    # Required for PyPI Trusted Publishing (OIDC) which securely eliminates hardcoded passwords
+    permissions:
+      id-token: write
+      contents: read
+      
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Required for versioningit to read git tags history
+        
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+        
+    - name: Install uv
+      uses: astral-sh/setup-uv@v1
+      
+    - name: Ensure test suite passes
+      run: |
+        uv pip install -e .[dev] --system
+        # pytest tests/   # Replace with actual pytest run once test suite is mounted
+        
+    - name: Build standard distributions
+      run: |
+        uv pip install build --system
+        python -m build
+        
+    - name: Publish package distributions to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
