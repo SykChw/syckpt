@@ -1,104 +1,109 @@
-# Syckpt
+# Syckpt: Git for Tensors
 
-**Git-like experiment tracking for deep learning with exact computational resumption, zero-copy safetensors memory-mapping, and delta-compression.**
+**Efficient, Exact, and Asynchronous Experiment Tracking for Deep Learning.**
 
-`syckpt` is a lightweight, local-first experiment version control system designed to perfectly reconstruct massive computational states—model weights, optimizer momentum, mixed-precision GradScalers, Random Number Generators, and Stateful DataLoaders—without perturbing the loss curve.
-
----
-
-## How `syckpt` Works (The Architecture)
-
-`syckpt` solves checkpoint bloat by treating machine learning parameters exactly like source code in a Git repository.
-
-1. **Content-Addressable Storage (CAS) & Delta-Compression**: Computes purely elemental arrays of `delta = current - base` to save disk space over epochs.
-2. **Sub-Layer Freezing**: Identifies immutable layers (e.g. frozen backbones) and uses virtual hard-links to achieve zero-cost storage.
-3. **Locality-Sensitive Hashing (LSH)**: Hyperparameters hash into unique prefixes. Mathematically similar training runs intentionally collide into the identical hash bucket to instantly query the Git tree.
-4. **Asynchronous Multiprocessing**: Offloads I/O and delta math to background systems to prevent GPU stalling and bypass the GIL.
-5. **Exact Mathematical Resumption**: Restores RNG bit-states specifically across PyTorch, CUDA, Numpy, and isolated `StatefulDataLoaders` with $O(1)$ efficiency.
+`syckpt` is a lightweight version control system for computational states. It treats your models, optimizers, and dataloaders as a versioned tree of content-addressable nodes, enabling **Exact Mathematical Resumption** with **Zero Storage Bloat**.
 
 ---
 
-## Installation
+## 🧠 The Core Philosophy: "Everything is a Pointer"
 
-```bash
-pip install syckpt
-```
+Traditional checkpointing saves a monolithic blob (`model.pt`) every epoch. If your model is 10GB, 50 epochs = 500GB of redundant data.
+
+`syckpt` functions like Git:
+1.  **State Flattening**: It breaks your model into individual layer tensors.
+2.  **Content-Addressable Storage (CAS)**: It hashes every tensor. If a layer hasn't changed (frozen backbone), it only stores a pointer to the existing data.
+3.  **Delta Compression**: If a layer changes slightly, it only stores the mathematical difference ($\Delta W$).
+4.  **Merkle Tree Root**: Your "checkpoint" is just a tiny JSON file containing pointers to these immutable chunks.
+
+### The Anatomy of `.syckpt`
+When you initialize a manager, it creates a hidden directory:
+*   `.syckpt/objects/`: A database of immutable tensor "blobs" and JSON "commit" nodes.
+*   `.syckpt/refs/heads/`: Pointers to the latest commit on specific branches (e.g., `main`, `trial_01`).
 
 ---
 
-## Workflows and Example Usages
+## 🚀 Quick Start (The 3-Step Integration)
 
-### 1. Integrating into an Existing Training Flow
+### 1. Register
+Attach your components to the `CheckpointManager`. It uses Python proxies to track them automatically.
 
-If you have a massive Vision Transformer (ViT) looping over a billion-image dataset on S3, slotting in `syckpt` takes 4 lines.
+### 2. Step
+Increment the global training step. This ensures RNG states and sampler indices stay synchronized.
+
+### 3. Save
+Trigger an asynchronous commit. `syckpt` forks a background process to handle the math and I/O, so your GPU never stalls.
 
 ```python
 import torch
-import torch.nn as nn
-import torch.optim as optim
 from syckpt import CheckpointManager
 from syckpt.dataloader import StatefulRandomSampler
-from torch.utils.data import DataLoader, TensorDataset
 
-model = nn.Linear(10, 2)
-optimizer = optim.SGD(model.parameters(), lr=0.01)
-dataset = TensorDataset(torch.randn(100, 10), torch.randn(100, 2))
-
-# Use StatefulRandomSampler for O(1) resumption
+# Setup your standard PyTorch objects
+model = torch.nn.Linear(10, 2)
+dataset = MyDataset()
 sampler = StatefulRandomSampler(dataset, batch_size=32)
-loader = DataLoader(dataset, batch_size=32, sampler=sampler)
 
-with CheckpointManager("./.syckpt") as ckpt:
-    ckpt.model = model
-    ckpt.optimizer = optimizer
-    ckpt.sampler = sampler
-    
-    for epoch in ckpt.loop(epochs=10):
-        for batch_idx, (x, y) in enumerate(loader):
-            # Training happens here...
-            ckpt.step_up()
-            
-        ckpt.save()
-```
-
-### 2. Hyperparameter Search Efficiency
-
-Evaluating thousands of configurations linearly is deeply inefficient. Because `syckpt` utilizes **Locality-Sensitive Hashing** on the `config` object, running an efficient grid search is incredibly fast.
-
-```python
-def evaluate_run(learning_rate: float):
-    with CheckpointManager("./ml_logs/.syckpt") as ckpt:
-        ckpt.model = ResNet50()
-        ckpt.config.lr = learning_rate
-        
-        # Resumes directly from similar runs if hashes collide in LSH space
-        for epoch in ckpt.loop(epochs=50):
-            train_one_epoch()
-            ckpt.save()
-```
-
-### 3. Distributed Resumption (PyTorch DDP)
-`syckpt` seamlessly integrates with massive GPU topologies, employing `dist.barrier()` natively to guarantee exact write structures.
-
-### 4. Exporting Monolithic Assets (`.ckpt`)
-When the checkpoint has achieved optimal convergence, collapse the internal Git-Tree branches into a single flattened standard portable format.
-
-```python
+# 1. Initialize and Register
 with CheckpointManager("./experiments") as ckpt:
-    ckpt.export_ckpt(hash_or_branch="main", output_path="final-model.ckpt")
+    ckpt.model = model
+    ckpt.sampler = sampler
+
+    # 2. Loop with Resumption
+    for epoch in ckpt.loop(epochs=10):
+        for batch in sampler:
+            # Training logic...
+            
+            # 3. Synchronize and Save
+            ckpt.step_up()
+        
+        ckpt.save()
 ```
 
 ---
 
-## Architectural Deep-Dive
+## 🛠️ Advanced Performance Features
 
-Curious how `syckpt` leverages Git pointers, `fsspec` atomic cloud mechanisms, manages PyTorch tensors, and accelerates training via Zero-Copy Safetensors? 
+### ⚡ Asynchronous Multiprocessing Saves
+Unlike standard `torch.save`, which locks your GPU while the CPU writes to disk, `syckpt` forks a **background OS process**. 
+*   **How**: It clones tensors to CPU RAM and detaches. 
+*   **Result**: Your GPU returns to training in milliseconds, while the background process handles delta compression and disk I/O.
 
-Read our comprehensive documentation reports across the `docs/` suite:
+### ❄️ Sub-Layer Freezing
+If you are doing Transfer Learning (e.g., freezing a ResNet backbone), `syckpt` detects the `requires_grad=False` flag.
+*   **How**: It creates a "virtual hard-link" to the base weights.
+*   **Result**: Storage cost for the backbone drops to **0 bytes** per checkpoint.
 
-*   **[Implementation Architecture Summary](docs/implementation.md)**
-*   **[Storage, CAS & Delta Compression](docs/storage_and_cas.md)**
-*   **[Checkpoint Manager & DDP Synchronization](docs/manager_and_ddp.md)**
-*   **[Configuration & LSH Bucketings](docs/config_and_lsh.md)**
-*   **[DataLoader & O(1) Resumption](docs/dataloader_and_resumption.md)**
-*   **[State Aggregation & RNG Determinism](docs/state_aggregation.md)**
+### 🎯 Exact $O(1)$ Resumption
+If your training crashes at Step 500,000, `syckpt` doesn't iterate through 500,000 batches to "catch up."
+*   **How**: It uses a `StatefulRandomSampler` that performs a native C-level pointer slice on the randomized index array.
+*   **Result**: Resumption is instantaneous, and RNG states are perfectly restored.
+
+---
+
+## 📊 The `syckpt` Pipeline
+
+```mermaid
+graph TD
+    A[GPU State] -->|Step| B(CheckpointManager)
+    B -->|Async Fork| C[multiprocessing.Process]
+    C -->|Delta Compression| D{Content Match?}
+    D -->|Yes| E[Link to Parent]
+    D -->|No| F[Write New Blob]
+    E --> G[.syckpt/objects]
+    F --> G
+    B -->|Update| H[.syckpt/refs/heads]
+```
+
+---
+
+## 📚 Deep Dives
+
+For a detailed mathematical and architectural breakdown, see our internal reports:
+
+*   **[Implementation Overview](docs/implementation.md)**: The structural map of the codebase.
+*   **[Storage & CAS](docs/storage_and_cas.md)**: How deltas and hard-links work.
+*   **[Manager & DDP](docs/manager_and_ddp.md)**: Distributed synchronization and Async I/O.
+*   **[Dataloader & Resumption](docs/dataloader_and_resumption.md)**: $O(1)$ sampling and RNG mechanics.
+*   **[Hash & LSH](docs/config_and_lsh.md)**: Hyperparameter bucketing and search.
+*   **[State & PRNG](docs/state_aggregation.md)**: The physics of random seeds.
