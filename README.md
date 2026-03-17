@@ -1,4 +1,4 @@
-# Syckpt v0.0.1
+# Syckpt
 
 **Git-like experiment tracking for deep learning with exact computational resumption, zero-copy safetensors memory-mapping, and delta-compression.**
 
@@ -126,3 +126,31 @@ Read our comprehensive documentation reports across the `docs/` suite:
 *   [04. Locality-Sensitive Hashing (LSH) for Hyperparameters](docs/04_lsh_and_hyperparameters.md)
 *   [05. Distributed Data Parallel (DDP) Mechanics](docs/05_ddp_synchronization.md)
 *   [06. Exact Mathematical Resumption and DataLoaders](docs/06_resumption_dataloader.md)
+
+---
+
+## Competitive Analysis & The MLOps Ecosystem
+
+The fundamental checkpointing challenge in deep learning is managing the exorbitant cost of physically storing 5GB to 100GB matrices repeatedly over epoch intervals. Below is a comparative analysis detailing where `syckpt` positions itself in the broader storage paradigm.
+
+### 1. The HuggingFace Hub (Standard Git+LFS)
+HuggingFace utilizes standard `git`. It tracks massive models using `git-lfs` pointers mapping to AWS S3.
+*   **How it Works:** Treats every tensor completely transparently as a massive opaque binary file. It uses Git Object models, but utilizes SHA-256 for chunking.
+*   **The Difference:** If an entire 10GB model is passed down a gradient trajectory, literally every floating-point variable inside the `.safetensors` file mutates slightly. Git LFS fails to compress this entirely, viewing it as a brand new 10GB block, and forces massive continuous upload speeds. 
+*   **Where `syckpt` Wins:** `syckpt` operates inside PyTorch directly before serialization, ripping the tensor strings out natively and executing element-wise subtractive patch $\Delta W$ mathematics. This shrinks the required bandwidth artificially to ~5%. `syckpt` focuses on the high-speed volatile development phase rather than the finalized storage of the end-product. 
+
+### 2. Weights & Biases (W&B Artifacts)
+W&B functions as a primary experiment tracking dashboard. It allows users to log massive model directories.
+*   **How it Works:** Executes standard SHA-1 deduplication. If `model.bin` exists inside Artifact $v0$, and you upload an identical `model.bin` inside Artifact $v1$, it simply references the initial string pointer without actively uploading the duplicate bytes.
+*   **The Difference:** Again, tracking training trajectories inherently modifies *all* bytes simultaneously. Thus W&B cannot deduplicate training runs gracefully locally unless the layers are explicitly frozen.
+*   **Where `syckpt` Wins:** `syckpt` utilizes LSH (Locality-Sensitive Hashing). Even if the user initiates a brand new run, tweaking the learning rate slightly, `syckpt` detects the hyperparameter collision automatically at execution time across local caches and dynamically forces the engine to Delta-Compress against the closest related experiment branch, saving massive local disk thresholds.
+
+### 3. MosaicML Composer
+Composer focuses entirely on training optimization, and introduces a robust `ObjectStore` backend natively handling S3 streaming checkpoint loading dynamically to prevent node disk-fill limits.
+*   **How it Works:** Periodically packages classical DDP model shards dynamically across multiple cloud buckets asynchronously in the background.
+*   **The Difference & Where `syckpt` Wins:** Composer utilizes brute-force cloud network speeds to circumvent local disk requirements (essentially throwing money and I/O at the problem). `syckpt` leverages CPU mathematical efficiency to minimize the objects entirely *before* network execution is even required via mathematical tensor geometry. 
+
+### Potential Future Avenues for `syckpt`
+*   **Sub-Layer Freezing:** Instead of Delta-Compressing the entire 10GB graph automatically, `syckpt` could explicitly evaluate which PyTorch layers mutated (e.g. tracking `requires_grad=False`), forcing instant hard-linking for un-mutated blocks similar to standard Docker layering.
+*   **Sub-classing Samplers:** The current `dataloader.py` method executes highly inefficient `next()` skipping to achieve exact mathematical resumption. `syckpt` should override `torch.utils.data.Sampler` natively in future releases to execute slice indexing over arrays identically to `[current_batch:]`. 
+*   **Asynchronous Storage Threads:** Moving the Delta-Compression operations (which are heavily CPU and memory bound) directly into an asynchronous background thread during the user loop to unblock GPU execution immediately.

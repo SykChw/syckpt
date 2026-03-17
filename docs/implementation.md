@@ -1,16 +1,33 @@
-# Implementation Guide: The `syckpt` Architecture
+# Syckpt Internal Documentation
 
-Welcome to the comprehensive implementation overview for `syckpt` v0.0.1. `syckpt` provides a robust, Git-native checkpointing system for PyTorch designed around zero-copy `safetensors` memory mapping, mathematical resumption, and delta compression.
+Welcome to the internal documentation suite for `syckpt`. 
 
-If you are looking for an educational deep dive into the computer science mechanisms powering this engine, we have constructed an exhaustively detailed series of documentations within the `docs/` folder.
+Each underlying python file has been deeply analyzed and mathematically deconstructed to serve as both an architectural reference and an educational resource explaining the concepts powering the package (Content Addressable Storage, Delta Compression, PRNG Sequences, Distributed Training Barriers, and Hash Hyperplanes).
 
-## The Architecture Deep-Dive Series
+Please explore the following monolithic guides depending on your focus:
 
-*   **[1. Content-Addressable Storage (CAS) and Worktrees](01_overview_and_cas.md)**: Explore how `syckpt` utilizes Git-native `.syckpt/objects` hidden directories to securely deduplicate parameter tensors using CAS and provide infinite branching without hard disk explosions.
-*   **[2. Delta Compression Mechanics](02_delta_compression.md)**: A mathematical breakdown of how parameter weights are element-wise subtracted from their base configurations across training epochs to achieve 90% memory efficiency.
-*   **[3. Safetensors and the Recursive Flattening Algorithm](03_safetensors_and_flattening.md)**: Why `pickle` is insecure, and the strict 1D-flattening algorithm implemented to allow the Linux Kernel to directly Map (mmap) arrays from SDD to GPU VRAM ("Zero Copy").
-*   **[4. Locality-Sensitive Hashing (LSH) for Hyperparameters](04_lsh_and_hyperparameters.md)**: See how continuous metadata parameters like Learning Rates and Beta values are deterministically bucked across hyperplanes into unique hashes identifying identical optimization landscapes.
-*   **[5. Distributed Data Parallel (DDP) Mechanics](05_ddp_synchronization.md)**: Coordinating atomic file writes across massively parallel 1,024-GPU supercomputing clusters utilizing `dist.barrier()` locks and NVLink broadcasting. 
-*   **[6. Exact Mathematical Resumption and DataLoaders](06_resumption_dataloader.md)**: Deep-dive into avoiding ML "Resumption Spikes" by deterministically recreating the shuffling configurations mid-epoch without infinite loops.
+## Component Deep-Dives
 
-For top-level syntax and framework integration strategies, return to the root `README.md`.
+1. **[`syckpt/storage.py`: Content Addressable Storage & Delta Compression](./storage_and_cas.md)**
+   * Educational deep dive into Content-Addressable Storage (CAS), Git Work-Trees, and Safetensors flat-dictionary requirements.
+   * Explores the mathematics of Stochastic Gradient Descent (SGD) and *why* mathematically delta-compression operates so efficiently on weight arrays.
+   * Full method breakdown for binary serialization, atomic writes via `fsspec`, and tree reconstruction.
+
+2. **[`syckpt/manager.py`: Orchestration & PyTorch DDP Synchronization](./manager_and_ddp.md)**
+   * Explains how Distributed Data Parallel (DDP) functions across multiple distinct OS environments.
+   * Deconstructs exactly how `dist.barrier()` and `broadcast_object_list()` are leveraged to prevent severe node-write corruption during checkpointing.
+   * Line breakdown of context bounding `save()`, `load()`, and `export_ckpt()`.
+
+3. **[`syckpt/config.py` & `syckpt/hash.py`: Configuration & LSH Bucketing](./config_and_lsh.md)**
+   * Explores the mathematical geometry of Locality-Sensitive Hashing (LSH) random hyperplanes and proofs of cosine-distance mapping.
+   * Analyzes Distance-Sensitive continuous quantization algorithms ensuring similar hyperparameter configs logically collide.
+   * Breakdown of the `HyperConfig` dot-notation dictionary proxy mapping.
+
+4. **[`syckpt/dataloader.py`: Slicing Iterators & Fast-Forwarding](./dataloader_and_resumption.md)**
+   * Explores how catastrophic forgetting and loss-curve spiking occurs when DataLoaders are not deterministically preserved across crashes.
+   * Analyzes the exact mechanics (and current loop-based inefficiency limitations) of fast-forwarding PyTorch `_iterator` object states dynamically.
+
+5. **[`syckpt/state.py`: PRNG Aggregation & The Seeds Of Randomness](./state_aggregation.md)**
+   * Educational breakdown of Pseudo-Random Number Generators (PRNGs), Linear Congruential Generators, and how temporal seeds function mathematically.
+   * Exploration of how CUDA, NumPy, Python, and PyTorch PRNGs structurally differ across physical arrays and CPU bounds.
+   * Deconstructs `StateManager`, exploring component routing and dynamic property assignments.
