@@ -6,7 +6,7 @@
 
 ---
 
-## 🧠 The Core Philosophy: "Everything is a Pointer"
+## The Core Philosophy: "Everything is a Pointer"
 
 Traditional checkpointing saves a monolithic blob (`model.pt`) every epoch. If your model is 10GB, 50 epochs = 500GB of redundant data.
 
@@ -23,7 +23,7 @@ When you initialize a manager, it creates a hidden directory:
 
 ---
 
-## 🚀 Quick Start (The 3-Step Integration)
+## Quick Start (The 3-Step Integration)
 
 ### 1. Register
 Attach your components to the `CheckpointManager`. It uses Python proxies to track them automatically.
@@ -62,26 +62,26 @@ with CheckpointManager("./experiments") as ckpt:
 
 ---
 
-## 🛠️ Advanced Performance Features
+## Advanced Performance Features
 
-### ⚡ Asynchronous Multiprocessing Saves
+### Asynchronous Multiprocessing Saves
 Unlike standard `torch.save`, which locks your GPU while the CPU writes to disk, `syckpt` forks a **background OS process**. 
 *   **How**: It clones tensors to CPU RAM and detaches. 
 *   **Result**: Your GPU returns to training in milliseconds, while the background process handles delta compression and disk I/O.
 
-### ❄️ Sub-Layer Freezing
+### Sub-Layer Freezing
 If you are doing Transfer Learning (e.g., freezing a ResNet backbone), `syckpt` detects the `requires_grad=False` flag.
 *   **How**: It creates a "virtual hard-link" to the base weights.
 *   **Result**: Storage cost for the backbone drops to **0 bytes** per checkpoint.
 
-### 🎯 Exact $O(1)$ Resumption
+### Exact $O(1)$ Resumption
 If your training crashes at Step 500,000, `syckpt` doesn't iterate through 500,000 batches to "catch up."
 *   **How**: It uses a `StatefulRandomSampler` that performs a native C-level pointer slice on the randomized index array.
 *   **Result**: Resumption is instantaneous, and RNG states are perfectly restored.
 
 ---
 
-## 📊 The `syckpt` Pipeline
+## The `syckpt` Pipeline
 
 ```mermaid
 graph TD
@@ -97,7 +97,7 @@ graph TD
 
 ---
 
-## 📚 Deep Dives
+## Deep Dives
 
 For a detailed mathematical and architectural breakdown, see our internal reports:
 
