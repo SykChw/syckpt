@@ -803,7 +803,7 @@ class CheckpointManager:
                 yield ep
             else:
                 for st in range(steps_per_epoch):
-                    self._step = start * steps_per_epoch + st
+                    self._step = ep * steps_per_epoch + st
                     yield ep, st
             if self.auto_resume:
                 self.save()
