@@ -31,3 +31,9 @@ Please explore the following monolithic guides depending on your focus:
    * Educational breakdown of Pseudo-Random Number Generators (PRNGs), Linear Congruential Generators, and how temporal seeds function mathematically.
    * Exploration of how CUDA, NumPy, Python, and PyTorch PRNGs structurally differ across physical arrays and CPU bounds.
    * Deconstructs `StateManager`, exploring component routing and dynamic property assignments.
+
+6. **[Advanced Concepts & Future Pipelines](./advanced_concepts.md)**
+   * Educational deep dive into advanced OS paradigms acting as future optimization pipelines.
+   * Explore the mathematics behind Sub-Layer Freezing and how transfer-learning zero-variance paths mimic Docker hard-linking.
+   * Analyze exactly how `Sampler` slicing bypasses primitive generator `next()` skipping to enforce absolute $O(1)$ zero-cost index resumption natively.
+   * Deconstructs Global Interpreter Lock (GIL) bypassing via asynchronous OS threads to eliminate H100 GPU I/O-bound pipeline stalling.
