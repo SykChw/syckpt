@@ -373,8 +373,16 @@ class CheckpointManager:
             base_hash = commit_data.get("parent")
             if not base_hash:
                 raise ValueError(f"Commit {commit_hash} requires delta resolution but has no parent.")
+            if base_hash == commit_hash:
+                raise ValueError(f"Commit {commit_hash} points to itself as a parent, infinite loop detected.")
+            
             base_tensors = self._fetch_tensors(base_hash)
-            return self.storage.load_tensors(blob_hash, base_tensors=base_tensors, is_delta=True)
+            return self.storage.load_tensors(
+                blob_hash, 
+                base_tensors=base_tensors, 
+                is_delta=True, 
+                frozen_links=blob_metadata.get("frozen_links", {})
+            )
         else:
             return self.storage.load_tensors(blob_hash, is_delta=False)
 
@@ -565,37 +573,65 @@ class CheckpointManager:
                 return current_hash
 
             base_hash = self._hash
+            
+            # Anti-Collision: LSH will output identical hashes for minor delta patches!
+            if base_hash and current_hash == base_hash:
+                import uuid
+                current_hash = f"{current_hash}-{uuid.uuid4().hex[:6]}"
+                
             metadata, flat_tensors = self._build_commit_data()
             
             if self.save_rng:
                 metadata["rng"] = rng_state
 
-            # Optional delta compression
-            base_tensors = None
-            if base_hash and self.storage.check_commit_exists(base_hash):
-                base_tensors = self._fetch_tensors(base_hash)
-
             blob_hash = current_hash # using same naming for blob
-            blob_metadata = self.storage.save_tensors(flat_tensors, blob_hash, base_tensors=base_tensors)
-
             commit_data = {
                 "hash": current_hash,
                 "parent": base_hash,
                 "message": message or "Update",
                 "metric": metric,
-                "blob_hash": blob_metadata["blob_hash"],
-                "blob_metadata": blob_metadata,
+                "blob_hash": blob_hash,
                 **metadata
             }
+            
+            # Offload heavy IO and CPU memory allocation to a multiprocessing fork
+            # We explicitly detach the tensors from the live GPU to CPU before handing off to the process.
+            cpu_tensors = {k: v.to("cpu", non_blocking=True).clone() for k, v in flat_tensors.items()}
+            
+            def _async_save_worker(comp_tensors, c_hash, b_hash, c_data, b_branch, fs_storage):
+                import logging
+                logger = logging.getLogger(__name__)
+                
+                logger.info(f"Async Save Started [PID: {os.getpid()}] processing blob {c_hash}")
+                b_tensors = None
+                if b_hash and fs_storage.check_commit_exists(b_hash):
+                    # In true production, this load should ideally be cached across the RAM barrier
+                    # but for total isolation safety, the child loads the base itself.
+                    b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
 
-            self.storage.save_commit(current_hash, commit_data)
-            self.storage.write_ref(self._current_branch, current_hash)
-            self.storage.write_head(self._current_branch)
+                blob_meta = fs_storage.save_tensors(comp_tensors, c_hash, base_tensors=b_tensors)
+                c_data["blob_metadata"] = blob_meta
+
+                fs_storage.save_commit(c_hash, c_data)
+                fs_storage.write_ref(b_branch, c_hash)
+                fs_storage.write_head(b_branch)
+                logger.info(f"Async Save Finished [PID: {os.getpid()}]")
+
+            import multiprocessing
+            p = multiprocessing.Process(
+                target=_async_save_worker,
+                args=(cpu_tensors, current_hash, base_hash, commit_data, self._current_branch, self.storage)
+            )
+            p.start()
+
+            # We locally update the host references instantly without waiting for the disk write!
             self._hash = current_hash
             self._commits[current_hash] = Commit.from_dict(commit_data)
             
-            if is_dist:
-                dist.barrier()
+            # NOTE: We specifically do not call `dist.barrier()` here anymore.
+            # If we called `dist.barrier()` at the end, Rank 0 would instantly hit the barrier
+            # and unblock the workers while its background process was still writing! 
+            # This is exactly what we want for pure async execution.
                 
             return current_hash
         finally:

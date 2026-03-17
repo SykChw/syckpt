@@ -131,16 +131,29 @@ def set_rng_state(state: Dict[str, Any]) -> None:
         state: Dict containing RNG states
     """
     if "torch_rng" in state:
-        torch.set_rng_state(state["torch_rng"])
+        val = state["torch_rng"]
+        if isinstance(val, list):
+            val = torch.tensor(val, dtype=torch.uint8)
+        torch.set_rng_state(val)
 
     if "cuda_rng" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda_rng"])
+        val = state["cuda_rng"]
+        if isinstance(val, list) and len(val) > 0 and isinstance(val[0], list):
+            val = [torch.tensor(v, dtype=torch.uint8) for v in val]
+        torch.cuda.set_rng_state_all(val)
 
     if "numpy_rng" in state:
-        np.random.set_state(state["numpy_rng"])
+        val = state["numpy_rng"]
+        if isinstance(val, list):
+            val = (val[0], np.array(val[1], dtype=np.uint32), val[2], val[3], val[4])
+        np.random.set_state(val)
 
     if "python_rng" in state:
-        random.setstate(state["python_rng"])
+        val = state["python_rng"]
+        if isinstance(val, list):
+            # Python random state format: (version, tuple(internal_state), gauss_next)
+            val = (val[0], tuple(val[1]), val[2]) if len(val) == 3 else tuple(val)
+        random.setstate(val)
 
     if "torch_compile_rng" in state and hasattr(torch, "_C"):
         try:

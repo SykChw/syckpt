@@ -56,29 +56,39 @@ def unflatten_state(structure: Any, tensors: Dict[str, torch.Tensor]) -> Any:
     else:
         return structure
 
-def compute_delta(current: Dict[str, torch.Tensor], base: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Computes the difference between two flat tensor dictionaries."""
+def compute_delta(current: Dict[str, torch.Tensor], base: Dict[str, torch.Tensor]) -> Dict[str, Any]:
+    """Computes the difference between two flat tensor dictionaries, identifying frozen subsets."""
     delta = {}
     for k, v in current.items():
         if k in base and v.shape == base[k].shape and v.dtype == base[k].dtype:
-            # We can only perform subtraction on same shape and dtype
-            delta[k] = v - base[k]
+            # Check if this entire layer is mathematically identical (e.g. frozen backbone)
+            # torch.equal is extremely fast and prevents saving un-mutated blocks.
+            if torch.equal(v, base[k]):
+                delta[k] = {"__frozen__": k}
+            else:
+                # Execute difference on mutated layers for heavy gzip compressibility
+                delta[k] = v - base[k]
         else:
             delta[k] = v
     return delta
 
-def apply_delta(base: Dict[str, torch.Tensor], delta: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Applies a delta to a base flat tensor dictionary."""
+def apply_delta(base: Dict[str, torch.Tensor], delta: Dict[str, Any]) -> Dict[str, torch.Tensor]:
+    """Applies a delta to a base flat tensor dictionary, resolving frozen links."""
     reconstructed = {}
-    # First copy all base tensors
-    for k, v in base.items():
-        reconstructed[k] = v.clone()
-        
+    
+    # We don't blind copy the whole base anymore to save massive RAM spikes
     for k, d in delta.items():
-        if k in reconstructed and d.shape == reconstructed[k].shape and d.dtype == reconstructed[k].dtype:
-            reconstructed[k] = reconstructed[k] + d
+        if isinstance(d, dict) and "__frozen__" in d:
+            # Virtual hard-link. This matrix didn't change at all! 
+            # We reference the base instantly.
+            reconstructed[k] = base[d["__frozen__"]].clone()
+        elif k in base and torch.is_tensor(d) and d.shape == base[k].shape and d.dtype == base[k].dtype:
+            # Delta Patch
+            reconstructed[k] = base[k].clone() + d
         else:
+            # Raw new tensor
             reconstructed[k] = d
+            
     return reconstructed
 
 class CASStorage:
@@ -100,8 +110,17 @@ class CASStorage:
             self.write_head("main")
 
     def _atomic_write_json(self, data: Any, path: str):
+        class TensorEncoder(json.JSONEncoder):
+            def default(self, obj):
+                if isinstance(obj, torch.Tensor):
+                    return obj.item() if obj.numel() == 1 else obj.tolist()
+                import numpy as np
+                if isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                return super().default(obj)
+                
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as tmp:
-            json.dump(data, tmp)
+            json.dump(data, tmp, cls=TensorEncoder)
             tmp_path = tmp.name
         try:
             self.fs.put_file(tmp_path, path)
@@ -202,18 +221,29 @@ class CASStorage:
                 os.unlink(tmp_path)
 
     def save_tensors(self, tensors: Dict[str, torch.Tensor], blob_hash: str, base_tensors: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, Any]:
-        """Saves tensors, potentially using delta compression if a base is provided."""
+        """Saves tensors, potentially using delta compression and layer-freezing if a base is provided."""
         blob_path = f"{self.objects_dir}/{blob_hash}.safetensors"
         
         metadata = {
             "blob_hash": blob_hash,
             "is_delta": False,
+            "frozen_links": {}
         }
         
         if base_tensors is not None:
-            # We have a base, compute delta
-            delta_tensors = compute_delta(tensors, base_tensors)
-            self._save_safetensors_fsspec(delta_tensors, blob_path)
+            # We have a base, compute delta map
+            delta_map = compute_delta(tensors, base_tensors)
+            
+            # Safetensors CANNOT save dictionaries `{"__frozen__": "k"}`.
+            # We must separate the pure floats from the virtual links.
+            pure_tensors = {}
+            for k, v in delta_map.items():
+                if isinstance(v, dict) and "__frozen__" in v:
+                    metadata["frozen_links"][k] = v["__frozen__"]
+                else:
+                    pure_tensors[k] = v
+                    
+            self._save_safetensors_fsspec(pure_tensors, blob_path)
             metadata["is_delta"] = True
             # base_hash tracking is handled by the caller commit metadata
         else:
@@ -221,8 +251,8 @@ class CASStorage:
             
         return metadata
         
-    def load_tensors(self, blob_hash: str, base_tensors: Optional[Dict[str, torch.Tensor]] = None, is_delta: bool = False) -> Dict[str, torch.Tensor]:
-        """Loads tensors, resolving delta if necessary."""
+    def load_tensors(self, blob_hash: str, base_tensors: Optional[Dict[str, torch.Tensor]] = None, is_delta: bool = False, frozen_links: Optional[Dict[str, str]] = None) -> Dict[str, torch.Tensor]:
+        """Loads tensors, resolving delta patches and hard-links if necessary."""
         blob_path = f"{self.objects_dir}/{blob_hash}.safetensors"
         if not self.fs.exists(blob_path):
             raise FileNotFoundError(f"Blob {blob_hash} not found in CAS storage.")
@@ -232,6 +262,13 @@ class CASStorage:
         if is_delta:
             if base_tensors is None:
                 raise ValueError(f"Blob {blob_hash} is a delta, but no base_tensors were provided.")
-            return apply_delta(base_tensors, loaded_tensors)
+            
+            # Re-inject the frozen string pointers so apply_delta can process them natively
+            delta_map = dict(loaded_tensors)
+            if frozen_links:
+                for k, frozen_key in frozen_links.items():
+                    delta_map[k] = {"__frozen__": frozen_key}
+                    
+            return apply_delta(base_tensors, delta_map)
         else:
             return loaded_tensors

@@ -1,7 +1,7 @@
-# Deep Dive: `syckpt/manager.py` & Distributed Data Parallel (DDP)
+# Deep Dive: `syckpt/manager.py` & Asynchronous DDP
 
 This document explores `manager.py`, the core orchestration engine of `syckpt`. 
-We will deconstruct how PyTorch Distributed Data Parallel (DDP) training fundamentally operates under the hood, and explicitly walk through how the `CheckpointManager` class leverages message passing to guarantee atomic, unified saves across multiple physical GPUs without catastrophic filesystem races.
+We will deconstruct how PyTorch Distributed Data Parallel (DDP) training fundamentally operates under the hood, and explicitly walk through how the `CheckpointManager` class leverages message passing and **Asynchronous Multiprocessing** to guarantee atomic, unified, zero-stall saves across massive clusters.
 
 ---
 
@@ -26,17 +26,13 @@ Because every GPU has the identical weights, we only want **Rank 0** to save the
 
 ---
 
-## 2. `CheckpointManager`: Safe Distributed Orchestration
+## 2. `CheckpointManager`: Asynchronous Safe Orchestration
 
-The `CheckpointManager` acts as the firewall preventing this corruption. It intercepts the user's `save()` command, forces network synchronization, assigns tasks strictly to Rank 0, and broadcasts results back.
+The `CheckpointManager` acts as the firewall preventing this corruption. It intercepts the user's `save()` command, forces network synchronization, assigns tasks strictly to Rank 0, broadcasts results back, and most importantly, natively forks an isolated background process to prevent GPU stalls.
 
 ### The `save()` Mechanism: A Line-by-Line Network Dance
 
 Let's dissect the core save routine.
-
-```python
-def save(self, metric: Optional[float] = None, message: str = "") -> str:
-```
 
 #### Step 1: The Network Barrier
 ```python
@@ -46,7 +42,7 @@ if dist.is_available() and dist.is_initialized():
     world_size = dist.get_world_size()
     is_dist = True
 ```
-If `syckpt.save()` is called at slightly different times by different GPUs (due to varying workload speeds), the system will crash. `dist.barrier()` forces all GPUs to halt execution until every single GPU reaches this exact line of code across the entire cluster.
+If `syckpt.save()` is called at slightly different times by different GPUs, the system will crash. `dist.barrier()` forces all GPUs to halt execution until every single GPU reaches this exact line of code across the entire cluster.
 
 #### Step 2: The Hash Broadcast
 ```python
@@ -57,13 +53,11 @@ if is_dist:
     dist.broadcast_object_list(hash_list, src=0)
     current_hash = hash_list[0]
 ```
-Rather than letting each GPU generate slightly disparate LSH strings, `syckpt` forces the Main process to generate the authoritative tracking string. It then uses `dist.broadcast_object_list()` to serialize that string and blast it over the network to Ranks 1-N.
+Rather than letting each GPU generate slightly disparate LSH strings, `syckpt` forces the Main process to generate the authoritative tracking string. It then uses `dist.broadcast_object_list()` to serialize that string and beam it over the network to Ranks 1-N.
 
 #### Step 3: RNG State Gathering
 If you want to resume DDP perfectly, you must save the CPU/CUDA random seeds of *every* GPU independently.
 ```python
-rng_state = get_rng_state() if self.save_rng else None
-
 if is_dist and self.save_rng:
     if is_main:
         gathered_rngs = [None for _ in range(world_size)]
@@ -77,21 +71,31 @@ if is_dist and self.save_rng:
 #### Step 4: Worker Exile
 ```python
 if not is_main:
-    if is_dist:
-        dist.barrier()
     self._hash = current_hash
     return current_hash
 ```
-All GPUs that are not Rank 0 are immediately kicked out of the function. They proceed to wait at another `dist.barrier()` for Rank 0 to finish the heavy disk I/O.
+All GPUs that are not Rank 0 are immediately kicked out of the function. They natively proceed to execute the next forward pass on the GPU without waiting for disk IO!
 
-#### Step 5: Master Physical Writing
-Rank 0 proceeds to serialize the weights, compute delta compressions utilizing `CASStorage`, and write to S3/Disk, entirely immune to file corruption since no other process is active.
+#### Step 5: Master Asynchronous Forking
+Rank 0 must compute heavy CPU mathematical deltas ($\Delta W = W_t - W_{t-1}$) and serialize massive byte streams to the SSD. If performed natively, the Main wrapper GPU will stall, forcing Workers 1-N to lock up waiting on the next batch's collective `All-Reduce`.
 
 ```python
-if is_dist:
-    dist.barrier()
+# Unblock the GPU by shifting arrays identically into isolated CPU RAM
+cpu_tensors = {k: v.to("cpu", non_blocking=True).clone() for k, v in flat_tensors.items()}
+
+import multiprocessing
+p = multiprocessing.Process(
+    target=_async_save_worker,
+    args=(cpu_tensors, current_hash, ... , self.storage)
+)
+p.start()
+
+# GPU instantly returns to the training loop unblocked
+return current_hash
 ```
-Rank 0 hits the final barrier, releasing the workers. The script continues.
+`threading.Thread` in Python is famously deadly because the **Global Interpreter Lock (GIL)** artificially bottlenecks execution, stealing CPU cycles from PyTorch's backend allocator.
+
+Instead, `syckpt` invokes an OS-level `multiprocessing.Process`. By cloning the tensors `to("cpu")` actively, the system cleanly severs the memory bridge graph. A dedicated detached Linux sub-system PID spins up in isolation, allocating its own RAM, performing the heavy IO math delta extraction, and dumping to Safetensors, completely independent from the core PyTorch training loop.
 
 ---
 
@@ -115,19 +119,6 @@ def __setattr__(self, name: str, value: Any):
         self.state_manager.register(**{name: value})
 ```
 Any component attached to the manager is routed straight into the `StateManager` architecture automatically.
-
-### Fast-Forward Iterators
-The package utilizes classical generator injection to handle training loops gracefully:
-```python
-def loop(self, epochs: int, steps_per_epoch: Optional[int] = None):
-    start = self._epoch
-    for ep in range(start, epochs):
-        self._epoch = ep
-        ...
-        if self.auto_resume:
-            self.save()
-```
-By yielding values through `manager.loop()`, it automatically resumes iteration counts specifically off the restored `self._epoch` class property retrieved from the underlying checkpoint JSON node.
 
 ### Monolithic Exporting (`export_ckpt`)
 ```python
