@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "syckpt"
-version = "0.0.3"
+version = "0.0.4"
 description = "Git-like experiment tracking for deep learning with exact computational resumption"
 readme = "README.md"
 requires-python = ">=3.8"

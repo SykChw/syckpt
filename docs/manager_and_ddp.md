@@ -575,14 +575,24 @@ Restore `torch.backends.cudnn.deterministic` and `torch.backends.cudnn.benchmark
 
 When used as `with CheckpointManager(...) as ckpt:`, the `__enter__` method:
 1. Acquires the file lock.
-2. Checks if the current branch has any commits.
-3. If yes, loads the latest checkpoint (restoring model, optimizer, PRNG states, step, epoch, batch_idx).
-4. If no, initializes a fresh hash.
+2. Checks the `run_mode` argument (`append` by default):
+    - If `run_mode == "overwrite"`, it can optionally purge the active branch if `overwrite=True` or ask the user interactively.
+    - If `run_mode == "new_branch"`, it creates a fresh branch before proceeding.
+3. Checks if the current branch has any commits.
+4. If yes, loads the latest checkpoint (restoring model, optimizer, PRNG states, step, epoch, batch_idx).
+5. If no, initializes a fresh hash.
 
 ```python
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            self.save()
+            if exc_type is not None:
+                self.save(message="[FAILED] \u274c")
+                logger.error(f"Training loop failed. Saved failure state to {self._hash}")
+            else:
+                self.save()
+            
+            # Print the tree visualization at the end of the run
+            self.print_tree()
         except Exception as e:
             logger.warning(f"Failed to save on exit: {e}")
         finally:
@@ -590,7 +600,7 @@ When used as `with CheckpointManager(...) as ckpt:`, the `__enter__` method:
         return False
 ```
 
-On exit, auto-save the final state and release the lock. The `return False` ensures exceptions propagate normally.
+On exit, auto-save the final state (or a `[FAILED] \u274c` state if an exception was raised), print the rich tree visualization of all branches, and release the lock. The `return False` ensures exceptions propagate normally.
 
 ---
 

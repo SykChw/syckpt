@@ -112,7 +112,10 @@ dataloader = DataLoader(dataset, batch_size=64, sampler=sampler)
 
 # ── Step 1: Register ─────────────────────────────────────────────────
 # Initialize a CheckpointManager pointing at your experiment directory.
-# The context manager (`with`) handles auto-resume on enter and auto-save on exit.
+# The context manager (`with`) handles auto-resume on enter, auto-save on exit,
+# and catches exceptions to log `[FAILED] \u274c` checkpoints!
+# The `max_to_keep` parameter determines pruning (currently a placeholder), but
+# because of Delta Compression, epoch-wise saving takes virtually zero space!
 with CheckpointManager("./my_experiment", max_to_keep=5) as ckpt:
 
     # Attach components via attribute assignment. Under the hood,
@@ -175,30 +178,84 @@ If your script crashes at epoch 7, simply re-run the same script. The `with Chec
 4. Restores all four PRNG states (Python `random`, NumPy, PyTorch CPU, PyTorch CUDA) so that dropout masks and data augmentation are identical.
 5. The `StatefulRandomSampler` uses $O(1)$ list slicing to skip to the exact batch index — no re-iteration.
 
+### Tree Navigation and Exact Resumption (`goto`)
+
+Because `syckpt` is a Git-like tree of nodes, every checkpoint corresponds to a unique hash. You do **not** need to memorize hashes! When the context manager exits, it automatically prints the entire commit tree, highlighting the `HEAD`. 
+
+If you see a historical branch or hash that achieved a great loss metric, you can instantly seamlessly restore the model, optimizer, dataloader, and config to that exact snapshot using `ckpt.goto()`:
+
+```python
+ckpt = CheckpointManager("./my_experiment")
+# Teleport your state back to a specific commit:
+ckpt.goto("a3f8c1d2") 
+
+# Or go to the tip of a branch:
+ckpt.goto("lr_sweep_high")
+```
+This is incredibly useful for **hyperparameter sweeps**. You can easily explore, back up, and branch off historical checkpoints with $O(1)$ time and space cost!
+
+### Case Studies: Controlling the Context Manager Loop
+
+When you re-run a training loop, you might want to start fresh or keep appending. The Context Manager accepts a `run_mode` flag to give you absolute control over the Git tree:
+
+#### Case 1: Additive Training on a New Branch (Recommended)
+You ran 50 epochs, stopped, and want to resume training for 50 more epochs, but you want to keep the original 50-epoch branch clean.
+```python
+# `run_mode="new_branch"` loads the latest commit, but immediately creates 
+# a new branch (e.g., `main_continue_a1b2`) and saves the new epochs there.
+with CheckpointManager("./my_experiment", run_mode="new_branch") as ckpt:
+    # training loop...
+```
+
+#### Case 2: Overwriting a Failed/Redundant Run
+You messed up your hyperparameters or realized the current branch is a dead end. You want to start completely fresh and wipe the current branch's history.
+```python
+# `run_mode="overwrite"` starts from scratch.
+# By default, it forcefuly purges the branch and starts anew.
+with CheckpointManager("./my_experiment", run_mode="overwrite") as ckpt:
+    # training loop...
+```
+
+#### Case 3: Manual Control (Without Context Manager)
+If you prefer precise control over when saves happen, bypass the `with` block:
+```python
+ckpt = CheckpointManager("./my_experiment", auto_resume=True)
+ckpt.model = model
+# ...
+if ckpt.auto_resume:
+    latest = ckpt.storage.read_ref(ckpt._current_branch)
+    if latest: ckpt.load(latest)
+
+for epoch in range(ckpt.epoch, 100):
+    # train...
+    if epoch % 10 == 0:
+        ckpt.save(message=f"manual save epoch {epoch}")
+```
+
 ### Branching Experiments
 
 ```python
-with CheckpointManager("./my_experiment") as ckpt:
-    ckpt.model = model
-    ckpt.optimizer = optimizer
+ckpt = CheckpointManager("./my_experiment")
+ckpt.model = model
+ckpt.optimizer = optimizer
 
-    # Create a named branch for a hyperparameter sweep
-    ckpt.create_branch("lr_sweep_high")
+# Create a named branch for a hyperparameter sweep
+ckpt.create_branch("lr_sweep_high")
 
-    # Change hyperparameters
-    for pg in optimizer.param_groups:
-        pg["lr"] = 5e-3
+# Change hyperparameters
+for pg in optimizer.param_groups:
+    pg["lr"] = 5e-3
 
-    # Train on this branch...
-    for epoch in ckpt.loop(epochs=5):
-        # ...
-        ckpt.save(message=f"lr=5e-3 epoch {epoch}")
+# Train on this branch...
+for epoch in ckpt.loop(epochs=5):
+    # ...
+    ckpt.save(message=f"lr=5e-3 epoch {epoch}")
 
-    # Switch back to main
-    ckpt.checkout_branch("main")
+# Switch back to main
+ckpt.checkout_branch("main")
 
-    # Export any commit to a standard PyTorch .ckpt for deployment
-    ckpt.export_ckpt("lr_sweep_high", "./deploy/model_best.ckpt")
+# Export any commit to a standard PyTorch .ckpt for deployment
+ckpt.export_ckpt("lr_sweep_high", "./deploy/model_best.ckpt")
 ```
 
 ---
@@ -212,7 +269,8 @@ Standard `torch.save()` is a blocking call: the CPU serializes tensors while the
 1. All live GPU tensors are copied to CPU RAM using `tensor.to("cpu", non_blocking=True).clone()`. The `.clone()` severs the autograd graph so the background process owns an independent copy.
 2. A `multiprocessing.Process` is spawned. This creates a new Linux PID with its own address space, completely bypassing the **Global Interpreter Lock (GIL)** — unlike `threading.Thread`, which shares the GIL and would contend with PyTorch's C++ backend allocator.
 3. The child process independently computes deltas ($\Delta W = W_t - W_{t-1}$), separates frozen layers, serializes to Safetensors, and writes the commit JSON — all while the parent process has already returned to the training loop.
-4. The GPU resumes the next forward pass in milliseconds. The background process finishes disk I/O independently.
+4. **Dtype Safety:** Delta compression automatically checks tensor shapes and `dtype` before compressing! If your precision changes (e.g., from `fp32` to `bf16`), it inherently detects the mismatch and safely stores the full tensor. Precision loss or mangled float states due to downcasting are impossible. 
+5. The GPU resumes the next forward pass in milliseconds. The background process finishes disk I/O independently.
 
 ### Sub-Layer Freezing Detection
 When performing transfer learning (e.g., fine-tuning only the classification head of a ResNet while the convolutional backbone has `requires_grad=False`), `syckpt` detects unchanged layers using `torch.equal()` — an optimized C++ element-wise comparison that short-circuits on the first mismatch.
@@ -318,11 +376,12 @@ graph TD
 For complete line-by-line code walkthroughs, mathematical proofs, and architectural breakdowns, see the internal documentation:
 
 *   **[Implementation Overview](docs/implementation.md)** — Architecture map, module dependencies, and end-to-end data flow.
-*   **[Storage & CAS](docs/storage_and_cas.md)** — Git work-trees, Merkle DAGs, `flatten_state`/`unflatten_state`, delta arithmetic, frozen hard-links, `CASStorage` class walkthrough.
-*   **[Manager & DDP](docs/manager_and_ddp.md)** — Distributed training synchronization, async multiprocessing saves, `__setattr__` proxy, file locking, `export_ckpt`.
-*   **[Dataloader & Resumption](docs/dataloader_and_resumption.md)** — Catastrophic forgetting, `StatefulRandomSampler` line-by-line, $O(1)$ slicing proof.
-*   **[Hash & LSH](docs/config_and_lsh.md)** — Locality-Sensitive Hashing geometry, cosine-distance proof, Distance-Sensitive quantization, `HyperConfig` proxy.
-*   **[State & PRNG](docs/state_aggregation.md)** — Pseudo-Random Number Generators, LCG/Mersenne Twister/PCG64, multi-backend state capture, `StateManager` duck-typing.
+*   **[Storage & CAS](docs/storage_and_cas.md)** — Git work-trees, Merkle DAGs, `flatten_state`/`unflatten_state`, delta arithmetic.
+*   **[Manager & DDP](docs/manager_and_ddp.md)** — Distributed training synchronization, async multiprocessing saves.
+*   **[Dataloader & Resumption](docs/dataloader_and_resumption.md)** — Catastrophic forgetting, `StatefulRandomSampler` line-by-line.
+*   **[Usage Guide](docs/usage.md)** — Branching, Mega-Hashes, and Tree Navigation.
+*   **[File Formats](docs/file_formats.md)** — Precision handling, CAS formats, and custom storage engines.
+*   **[Future Outlook](docs/future.md)** — Hierarchical Mega-Hashes for massive experiments.
 
 ---
 

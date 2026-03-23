@@ -282,7 +282,10 @@ Iterate over every tensor key in the current state.
 ```python
         if k in base and v.shape == base[k].shape and v.dtype == base[k].dtype:
 ```
-**Guard clause:** Delta computation is only valid when the base contains the same key with matching shape and dtype. If the model architecture changed between checkpoints (e.g., added a new layer), this guard falls through to the raw-tensor branch below.
+**Guard clause for Shape & Dtype Safety:** Delta computation is only mathematically valid when the base contains exactly the same tensor topology. `syckpt` inherently protects against:
+- **Architecture mutations:** If you add a new layer, `v` won't exist in `base`, triggering the fallback.
+- **Precision mismatch:** If you resume training in `bf16` after starting in `fp32`, `v.dtype == base[k].dtype` fails. `syckpt` will securely flush the full `bf16` tensor rather than risk mathematically corrupting precision through an `fp32 - bf16` delta downcast.
+If this guard falls through, we enter the raw-tensor fallback branch below.
 
 ```python
             if torch.equal(v, base[k]):

@@ -100,9 +100,11 @@ class CASStorage:
         self.syckpt_dir = f"{self.fs_path}/.syckpt"
         self.objects_dir = f"{self.syckpt_dir}/objects"
         self.refs_dir = f"{self.syckpt_dir}/refs/heads"
+        self.tags_dir = f"{self.syckpt_dir}/refs/tags"
         
         self.fs.makedirs(self.objects_dir, exist_ok=True)
         self.fs.makedirs(self.refs_dir, exist_ok=True)
+        self.fs.makedirs(self.tags_dir, exist_ok=True)
         
         # Initialize HEAD
         head_path = f"{self.syckpt_dir}/HEAD"
@@ -179,6 +181,36 @@ class CASStorage:
             return True
         return False
 
+    # Git-native tag management
+    def write_tag(self, tag_name: str, commit_hash: str):
+        """Sets a tag ref to a specific commit hash."""
+        tag_path = f"{self.tags_dir}/{tag_name}"
+        with self.fs.open(tag_path, "w") as f:
+            f.write(commit_hash)
+
+    def read_tag(self, tag_name: str) -> Optional[str]:
+        """Reads the commit hash for a tag."""
+        tag_path = f"{self.tags_dir}/{tag_name}"
+        if not self.fs.exists(tag_path):
+            return None
+        with self.fs.open(tag_path, "r") as f:
+            return f.read().strip()
+
+    def list_tags(self) -> List[str]:
+        """Lists all local tags."""
+        if not self.fs.exists(self.tags_dir):
+            return []
+        tags = self.fs.ls(self.tags_dir, detail=False)
+        return [t.split("/")[-1] for t in tags]
+
+    def delete_tag(self, tag_name: str) -> bool:
+        """Deletes a tag ref."""
+        tag_path = f"{self.tags_dir}/{tag_name}"
+        if self.fs.exists(tag_path):
+            self.fs.rm(tag_path)
+            return True
+        return False
+
     # Git-native object management
     def save_commit(self, commit_hash: str, commit_data: Dict[str, Any]):
         """Saves a commit metadata object (Tree+Commit equivalent)."""
@@ -194,6 +226,44 @@ class CASStorage:
         
     def check_commit_exists(self, commit_hash: str) -> bool:
         return self.fs.exists(f"{self.objects_dir}/{commit_hash}.json")
+
+    def get_commit_tree(self) -> Dict[str, Any]:
+        """Returns the commit graph by tracing back from all branch tips."""
+        branches = self.list_branches()
+        commits = {}
+        branch_tips = {}
+        
+        for branch in branches:
+            tip = self.read_ref(branch)
+            if tip:
+                branch_tips[branch] = tip
+                curr = tip
+                while curr and curr not in commits:
+                    try:
+                        c_data = self.load_commit(curr)
+                        commits[curr] = c_data
+                        
+                        # Process sub-commits of MegaHashes so they appear in history!
+                        if c_data.get("is_mega"):
+                            for sub_hash in c_data.get("sub_commits", []):
+                                try:
+                                    sc_data = self.load_commit(sub_hash)
+                                    commits[sub_hash] = sc_data
+                                except FileNotFoundError:
+                                    pass
+                                    
+                        curr = c_data.get("parent")
+                    except FileNotFoundError:
+                        break
+                        
+        # Append tags to output graph
+        tags = {}
+        for tag in self.list_tags():
+            t_hash = self.read_tag(tag)
+            if t_hash:
+                tags[tag] = t_hash
+                        
+        return {"commits": commits, "branch_tips": branch_tips, "tags": tags}
 
     def _save_safetensors_fsspec(self, tensors: Dict[str, torch.Tensor], path: str):
         """Saves a safetensors file over fsspec using a local temporary file."""

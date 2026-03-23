@@ -5,7 +5,7 @@ import json
 import fcntl
 import logging
 from pathlib import Path
-from typing import Any, Dict, Optional, Union, Tuple
+from typing import Any, Dict, Optional, Union, Tuple, List
 from datetime import datetime
 
 import torch
@@ -90,7 +90,10 @@ class Commit:
         "metric",
         "timestamp",
         "blob_hash",
-        "blob_metadata"
+        "blob_metadata",
+        "components_structure",
+        "rng",
+        "deterministic"
     )
 
     def __init__(
@@ -103,7 +106,10 @@ class Commit:
         config: Optional[Dict] = None,
         metric: Optional[float] = None,
         blob_hash: Optional[str] = None,
-        blob_metadata: Optional[Dict] = None
+        blob_metadata: Optional[Dict] = None,
+        components_structure: Optional[Dict] = None,
+        rng: Optional[Any] = None,
+        deterministic: Optional[Any] = None,
     ):
         self.hash = hash
         self.parent = parent
@@ -115,6 +121,9 @@ class Commit:
         self.timestamp = datetime.now().isoformat()
         self.blob_hash = blob_hash or hash
         self.blob_metadata = blob_metadata or {}
+        self.components_structure = components_structure
+        self.rng = rng
+        self.deterministic = deterministic
 
     def to_dict(self) -> Dict:
         return {
@@ -127,7 +136,10 @@ class Commit:
             "metric": self.metric,
             "timestamp": self.timestamp,
             "blob_hash": self.blob_hash,
-            "blob_metadata": self.blob_metadata
+            "blob_metadata": self.blob_metadata,
+            "components_structure": self.components_structure,
+            "rng": self.rng,
+            "deterministic": self.deterministic
         }
 
     @classmethod
@@ -141,7 +153,10 @@ class Commit:
             data.get("config", {}),
             data.get("metric"),
             data.get("blob_hash"),
-            data.get("blob_metadata", {})
+            data.get("blob_metadata", {}),
+            data.get("components_structure"),
+            data.get("rng"),
+            data.get("deterministic")
         )
         c.timestamp = data.get("timestamp", c.timestamp)
         return c
@@ -167,6 +182,10 @@ class CheckpointManager:
         "_hash",
         "_current_branch",
         "_commits",
+        "_session_commits",
+        "_session_start_hash",
+        "_top_k_metrics",
+        "run_mode",
     )
 
     def __init__(
@@ -178,6 +197,7 @@ class CheckpointManager:
         save_rng: bool = True,
         lock_timeout: int = 30,
         hash_length: int = 8,
+        run_mode: str = "new_branch",
     ):
         self.root = str(dirpath)
         self.storage = CASStorage(self.root)
@@ -186,6 +206,7 @@ class CheckpointManager:
         self.maximize = maximize
         self.auto_resume = auto_resume
         self.save_rng = save_rng
+        self.run_mode = run_mode
 
         # Lock is only used if the path is primarily local
         if not self.root.startswith(("s3://", "gcs://", "http://", "https://")):
@@ -205,6 +226,9 @@ class CheckpointManager:
         self._hash: Optional[str] = None
         self._current_branch = self.storage.read_head()
         self._commits: Dict[str, Commit] = {}
+        self._session_commits: List[str] = []
+        self._session_start_hash: Optional[str] = None
+        self._top_k_metrics: List[Tuple[float, str]] = []
 
         # Load latest commit from the active branch if it exists
         branch_hash = self.storage.read_ref(self._current_branch)
@@ -285,7 +309,8 @@ class CheckpointManager:
             "maximize",
             "auto_resume",
             "save_rng",
-            "state_manager"
+            "state_manager",
+            "run_mode"
         ):
             object.__setattr__(self, name, value)
         else:
@@ -366,6 +391,10 @@ class CheckpointManager:
     def _fetch_tensors(self, commit_hash: str) -> Dict[str, torch.Tensor]:
         """Recursively resolves delta-compressed safetensors blobs for a commit."""
         commit_data = self.storage.load_commit(commit_hash)
+        
+        if commit_data.get("is_mega") and commit_data.get("sub_commits"):
+            return self._fetch_tensors(commit_data["sub_commits"][-1])
+            
         blob_metadata = commit_data.get("blob_metadata", {})
         blob_hash = blob_metadata.get("blob_hash", commit_hash)
         
@@ -536,6 +565,24 @@ class CheckpointManager:
         return diff
 
     # Save/Load - utilizing Safetensors & Delta Compression
+    def _update_top_k(self, current_hash: str, metric: float):
+        if self.max_to_keep <= 0:
+            return
+            
+        self._top_k_metrics.append((metric, current_hash))
+        self._top_k_metrics.sort(key=lambda x: x[0], reverse=self.maximize)
+        
+        if len(self._top_k_metrics) > self.max_to_keep:
+            self._top_k_metrics = self._top_k_metrics[:self.max_to_keep]
+            
+        # Wipe all old tags and rewrite Best-K
+        for tag in self.storage.list_tags():
+            if tag.startswith("best_"):
+                self.storage.delete_tag(tag)
+                
+        for i, (_, h) in enumerate(self._top_k_metrics):
+            self.storage.write_tag(f"best_{i+1}", h)
+
     def save(self, metric: Optional[float] = None, message: str = "") -> str:
         self._lock_acquire()
         try:
@@ -627,6 +674,11 @@ class CheckpointManager:
             # We locally update the host references instantly without waiting for the disk write!
             self._hash = current_hash
             self._commits[current_hash] = Commit.from_dict(commit_data)
+            
+            if is_main:
+                self._session_commits.append(current_hash)
+                if metric is not None:
+                    self._update_top_k(current_hash, metric)
             
             # NOTE: We specifically do not call `dist.barrier()` here anymore.
             # If we called `dist.barrier()` at the end, Rank 0 would instantly hit the barrier
@@ -797,16 +849,22 @@ class CheckpointManager:
 
     def loop(self, epochs: int, steps_per_epoch: Optional[int] = None):
         start = self._epoch
-        for ep in range(start, epochs):
-            self._epoch = ep
-            if steps_per_epoch is None:
-                yield ep
-            else:
-                for st in range(steps_per_epoch):
-                    self._step = ep * steps_per_epoch + st
-                    yield ep, st
-            if self.auto_resume:
-                self.save()
+        self._session_start_hash = self._hash
+        self._session_commits = []
+        try:
+            for ep in range(start, epochs):
+                self._epoch = ep
+                if steps_per_epoch is None:
+                    yield ep
+                else:
+                    for st in range(steps_per_epoch):
+                        self._step = ep * steps_per_epoch + st
+                        yield ep, st
+                if self.auto_resume:
+                    self.save()
+        finally:
+            if self._session_commits:
+                self.group_commits(message=f"Loop Mega-Hash ({epochs} epochs)")
 
     def list_checkpoints(self) -> Dict[str, str]:
         # Without branches folder per commit, we just list the branch tip commits
@@ -821,33 +879,166 @@ class CheckpointManager:
     def __enter__(self) -> "CheckpointManager":
         self._lock_acquire()
 
+        self._session_commits = []
+        self._session_start_hash = self._hash
+
         if self.auto_resume:
             latest = self.storage.read_ref(self._current_branch)
             if latest and self.storage.check_commit_exists(latest):
-                try:
-                    self.load(latest)
-                    logger.info(
-                        f"Resumed from step {self._step}, batch {self._batch_idx}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to resume from {latest}: {e}")
+                
+                if self.run_mode == "overwrite":
+                    # Start fresh
+                    self.storage.delete_ref(self._current_branch)
+                    self._hash = self._generate_hash()
+                    logger.info(f"Overwrote branch {self._current_branch}, starting fresh with {self._hash}")
+                    self._session_start_hash = self._hash
+
+                elif self.run_mode == "append":
+                    try:
+                        self.load(latest)
+                        logger.info(
+                            f"Resumed from step {self._step}, batch {self._batch_idx} on branch {self._current_branch}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Failed to resume from {latest}: {e}")
+                else: # new_branch
+                    try:
+                        self.load(latest)
+                        import uuid
+                        new_branch_name = f"{self._current_branch}_continue_{uuid.uuid4().hex[:4]}"
+                        self._current_branch = new_branch_name
+                        self.storage.write_head(new_branch_name)
+                        self.storage.write_ref(new_branch_name, latest)
+                        logger.info(f"Created new branch {new_branch_name} for additive training")
+                    except Exception as e:
+                        logger.warning(f"Failed to resume from {latest}: {e}")
             else:
                 # Need initial save
                 self._hash = self._generate_hash()
                 logger.info(f"Initialized new branch {self._current_branch} with {self._hash}")
+                self._session_start_hash = self._hash
         else:
             self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
 
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            self.save()
+            if exc_type is not None:
+                self.save(message=f"[FAILED] \u274c {exc_type.__name__}")
+                logger.error(f"Training failed with {exc_type.__name__}. Saved failure state.")
         except Exception as e:
             logger.warning(f"Failed to save on exit: {e}")
         finally:
+            self.group_commits(message="Training Loop Mega-Hash")
             self._lock_release()
+            self.print_tree()
         return False
+
+    def group_commits(self, message: str = "Mega-Hash"):
+        """Clubs recent session commits into a single UI MegaCommit."""
+        if not self._session_commits or len(self._session_commits) <= 1:
+            return
+            
+        import uuid
+        mega_hash = f"mega_{uuid.uuid4().hex[:8]}"
+        last_commit = self._session_commits[-1]
+        
+        if last_commit not in self._commits:
+            return
+            
+        last_data = self._commits[last_commit]
+        
+        mega_commit_data = {
+            "hash": mega_hash,
+            "parent": self._session_start_hash,
+            "is_mega": True,
+            "sub_commits": self._session_commits,
+            "message": message,
+            "step": self._step,
+            "epoch": self._epoch,
+            "metric": last_data.metric,
+            "config": self._config.to_dict(),
+            "timestamp": datetime.now().isoformat(),
+            "components_structure": last_data.components_structure or {},
+            "rng": last_data.rng,
+            "deterministic": last_data.deterministic
+        }
+        
+        self.storage.save_commit(mega_hash, mega_commit_data)
+        self.storage.write_ref(self._current_branch, mega_hash)
+        self.storage.write_head(self._current_branch)
+        
+        self._hash = mega_hash
+        self._commits[mega_hash] = Commit.from_dict(mega_commit_data)
+        self._session_commits = []
+
+    def print_tree(self):
+        """Prints the entire commit tree across all branches and highlights the current HEAD."""
+        try:
+            tree_data = self.storage.get_commit_tree()
+        except Exception:
+            return
+            
+        commits = tree_data["commits"]
+        branch_tips = tree_data["branch_tips"]
+        
+        children = {}
+        for h in commits.keys():
+            children[h] = []
+            
+        roots = []
+        for h, c in commits.items():
+            p = c.get("parent")
+            if p and p in commits:
+                children[p].append(h)
+            else:
+                roots.append(h)
+                
+        def _print_node(node_hash, prefix="", is_last=True):
+            c = commits[node_hash]
+            
+            is_mega = c.get("is_mega")
+            if is_mega:
+                msg = f"[MEGA-HASH] {len(c.get('sub_commits', []))} sub-commits ({c.get('message', '')})"
+            else:
+                msg = c.get("message", "")
+                
+            epoch = c.get("epoch", 0)
+            metric = c.get("metric")
+            metric_str = f" | metric: {metric:.4f}" if metric is not None else ""
+            
+            labels = []
+            if node_hash == self._hash:
+                labels.append("HEAD")
+            for b, tip in branch_tips.items():
+                if tip == node_hash:
+                    if b == self._current_branch:
+                        labels.append(f"*{b}*")
+                    else:
+                        labels.append(b)
+                        
+            # Map tags
+            tags = tree_data.get("tags", {})
+            for t_name, t_val in tags.items():
+                if t_val == node_hash:
+                    labels.append(f"[TAG: {t_name}]")
+                        
+            label_str = f" ({', '.join(labels)})" if labels else ""
+            connector = "└── " if is_last else "├── "
+            
+            print(f"{prefix}{connector}{node_hash[:8]}{label_str}: {msg} [Epoch {epoch}]{metric_str}")
+            
+            child_list = children.get(node_hash, [])
+            for i, child in enumerate(child_list):
+                extension = "    " if is_last else "│   "
+                _print_node(child, prefix + extension, i == len(child_list) - 1)
+                
+        print(f"\n--- Syckpt Tree [{'LOCAL' if not self._lock else 'DIST'}] ---")
+        for i, r in enumerate(roots):
+            _print_node(r, "", i == len(roots) - 1)
+        print("----------------------\n")
 
 
 def create_checkpoint(dirpath: Union[str, Path], **kwargs) -> CheckpointManager:
