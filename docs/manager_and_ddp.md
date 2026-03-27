@@ -1,6 +1,6 @@
 # Deep Dive: `syckpt/manager.py` — Orchestration, Async Saves & DDP Synchronization
 
-This document is a complete, line-by-line examination of `manager.py` (855 lines), the core orchestration engine of `syckpt`. It covers:
+This document is a complete, line-by-line examination of `manager.py`, the core orchestration engine of `syckpt`. It covers:
 
 - How PyTorch Distributed Data Parallel (DDP) works at the process level
 - How `CheckpointManager.save()` synchronizes a multi-GPU cluster, then forks a GIL-free background process
@@ -21,6 +21,8 @@ This document is a complete, line-by-line examination of `manager.py` (855 lines
 7. [Branching, Logging, and Diffing](#7-branching-logging-and-diffing)
 8. [Exporting to Standard PyTorch Format](#8-exporting-to-standard-pytorch-format)
 9. [Utilities: `step_up`, `loop`, Context Manager](#9-utilities-step_up-loop-context-manager)
+10. [Mega-Hash Squashing](#10-mega-hash-squashing)
+11. [Future: Hierarchical Mega-Hashes](#11-future-hierarchical-mega-hashes)
 
 ---
 
@@ -147,7 +149,8 @@ The class also implements `__enter__`/`__exit__` for `with` statement usage.
 class Commit:
     __slots__ = (
         "hash", "parent", "message", "step", "epoch",
-        "config", "metric", "timestamp", "blob_hash", "blob_metadata"
+        "config", "metric", "timestamp", "blob_hash",
+        "blob_metadata", "components_structure", "rng", "deterministic"
     )
 ```
 
@@ -155,9 +158,11 @@ A lightweight data class representing a saved checkpoint — analogous to a Git 
 
 Key fields:
 - **`hash`** — The LSH-derived commit identifier.
-- **`parent`** — The hash of the previous commit (forms the Merkle DAG chain).
+- **`parent`** — The hash of the previous commit (`None` for the first commit in a session).
 - **`blob_hash`** — Points to the `.safetensors` file in `.syckpt/objects/`.
 - **`blob_metadata`** — Dict with `is_delta` (bool) and `frozen_links` (dict of frozen layer keys).
+- **`components_structure`** — JSON-serializable schema describing the nested structure of the state dict (needed by `group_commits` to create Mega-Hash metadata without re-reading disk).
+- **`rng`** / **`deterministic`** — Captured PRNG and cuDNN state at save time, also cached in-memory to prevent race conditions in `group_commits` when async workers haven't yet written their `.json` files.
 
 The `to_dict()` / `from_dict()` methods serialize to/from JSON for storage.
 
@@ -172,7 +177,9 @@ class CheckpointManager:
     __slots__ = (
         "root", "storage", "max_to_keep", "maximize", "auto_resume",
         "save_rng", "_lock", "_locked", "state_manager", "_config",
-        "_step", "_epoch", "_batch_idx", "_hash", "_current_branch", "_commits",
+        "_step", "_epoch", "_batch_idx", "_hash", "_current_branch",
+        "_commits", "_session_commits", "_session_start_hash",
+        "_top_k_metrics", "run_mode", "_bg_processes",
     )
 ```
 
@@ -194,21 +201,33 @@ Creates the `CASStorage` instance, which initializes the `.syckpt/` directory st
 - `HyperConfig` — the nested dict proxy that tracks hyperparameters for LSH hashing.
 
 ```python
+        self.run_mode = run_mode
+        self._session_commits: List[str] = []
+        self._session_start_hash: Optional[str] = None
+        self._top_k_metrics: List[Tuple[float, str]] = []
+        self._bg_processes: list = []
+
         self._hash: Optional[str] = None
         self._current_branch = self.storage.read_head()
         self._commits: Dict[str, Commit] = {}
 ```
-- `_hash` — the hash of the currently active commit (or `None` if uninitialized).
-- `_current_branch` — read from `.syckpt/HEAD` on startup.
-- `_commits` — in-memory cache of loaded commits to avoid repeated disk reads.
+- `run_mode` — controls branching behaviour on each `with` invocation.
+- `_session_commits` — hashes collected during the current `loop()` / `with` block, used by `group_commits` to build the Mega-Hash.
+- `_bg_processes` — list of background `multiprocessing.Process` objects. Joined before `group_commits` is called so that workers can't overwrite the branch ref after the Mega-Hash has been written.
 
 ```python
         branch_hash = self.storage.read_ref(self._current_branch)
-        if branch_hash:
+        if branch_hash and self.storage.check_commit_exists(branch_hash):
             self._hash = branch_hash
-            self._load_commit_into_cache(branch_hash)
+            try:
+                data = self.storage.load_commit(branch_hash)
+                if not data.get("is_mega"):
+                    self._load_commit_into_cache(branch_hash)
+            except Exception:
+                pass
 ```
-On startup, check if the current branch has any commits. If so, cache the tip commit.
+
+On startup, cache the branch tip — but **skip Mega-Hash commits** (they have no tensor blob and exist only as UI grouping nodes).
 
 ### The `__setattr__` Proxy — Magic Registration
 
@@ -352,14 +371,23 @@ The second `dist.barrier()` here ensures workers don't race ahead and attempt an
 ```python
             base_hash = self._hash
 
-            if base_hash and current_hash == base_hash:
+            base_c_hash = current_hash
+            while self.storage.check_commit_exists(current_hash) or current_hash in self._commits:
                 import uuid
-                current_hash = f"{current_hash}-{uuid.uuid4().hex[:6]}"
+                current_hash = f"{base_c_hash}-{uuid.uuid4().hex[:6]}"
+
+            # If the base has never been committed, treat this save as a root.
+            if base_hash == current_hash or not self.storage.check_commit_exists(base_hash):
+                base_hash = None
 ```
 
-LSH is designed to produce **identical hashes** for similar configs — that's its purpose. But if the same config is used across consecutive checkpoints (same model, same optimizer, same hyperparams), the LSH hash will be identical to the parent's hash. This would overwrite the parent's `.safetensors` and `.json` files, destroying the base needed for delta resolution.
+LSH is designed to produce **identical hashes** for similar configs — that's its purpose. But if the same config is used across consecutive checkpoints (same model, same optimizer, same hyperparams), the LSH hash would be identical to the parent's hash. This would:
+1. Overwrite the parent's `.safetensors` file, destroying the base needed for delta resolution.
+2. Create a **self-referential parent** (`parent == hash`), breaking tree traversal.
 
-The UUID suffix ensures uniqueness while preserving the LSH locality property in the prefix.
+The fix uses a `while` loop (not a simple `if`) to guarantee uniqueness against **all existing objects on disk and in the in-memory cache**. The UUID suffix preserves the LSH locality property in the shared prefix (e.g. `9af15b33-24c3f9`).
+
+The second guard sets `base_hash = None` when the base commit has never actually been written to disk (e.g. the very first save in a session, where `__enter__` generates a placeholder hash that is never committed). This prevents the first commit from having a phantom parent.
 
 ### Step 6: Build Commit Data
 
@@ -407,10 +435,16 @@ Build the full commit JSON by merging the hash, parent pointer, user message, me
                 logger.info(f"Async Save Started [PID: {os.getpid()}] processing blob {c_hash}")
                 b_tensors = None
                 if b_hash and fs_storage.check_commit_exists(b_hash):
-                    b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
+                    # Skip Mega-Hash commits — they are UI containers with no tensor blob.
+                    try:
+                        b_meta = fs_storage.load_commit(b_hash)
+                        if not b_meta.get("is_mega"):
+                            b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
+                    except Exception:
+                        b_tensors = None
 ```
 
-The worker loads the base tensors from the parent commit's `.safetensors` file. It loads them with `is_delta=False` because in this context, it needs the raw tensor data from the file — the delta resolution for the base itself was already handled when the base was originally saved.
+The worker loads base tensors for delta compression, **but skips Mega-Hash parents** — Mega-Hashes are metadata containers with no `.safetensors` blob. Attempting to load tensors from one would raise a `FileNotFoundError`.
 
 ```python
                 blob_meta = fs_storage.save_tensors(comp_tensors, c_hash, base_tensors=b_tensors)
@@ -454,6 +488,8 @@ Python's **Global Interpreter Lock (GIL)** is a mutex that protects access to Py
 
 The parent process updates its in-memory state immediately and returns — **the GPU is unblocked in milliseconds**, while the background process may continue writing for seconds.
 
+> **Key design note:** The background process is appended to `self._bg_processes`. Before `group_commits` is called (to write the Mega-Hash as the branch tip), all workers in this list are **joined** (`p.join(timeout=120)`). This ordering is critical: if workers were allowed to run past `group_commits`, they would overwrite the branch ref with the last sub-commit's hash, clobbering the Mega-Hash pointer.
+
 ---
 
 ## 6. The `load()` and Auto-Resume Path
@@ -462,22 +498,22 @@ The parent process updates its in-memory state immediately and returns — **the
 
 ```python
     def load(self, hash: Optional[str] = None) -> Dict:
-        self._lock_acquire()
-        try:
-            if hash is None:
-                hash = self._hash
-            if not hash:
-                raise ValueError("No hash provided and manager is uninitialized.")
-            if not self.storage.check_commit_exists(hash):
-                raise ValueError(f"Commit not found: {hash}")
-```
-Load a specific commit by hash. If no hash is given, reload the current commit.
+        ...
+        commit_data = self.storage.load_commit(hash)
 
-```python
-            commit_data = self.storage.load_commit(hash)
-            flat_tensors = self._fetch_tensors(hash)
-            self._restore_commit_data(commit_data, flat_tensors)
+        # Mega-hash commits are UI grouping containers with no tensor blob.
+        # Transparently resolve to the last real sub-commit.
+        if commit_data.get("is_mega") and commit_data.get("sub_commits"):
+            last_sub = commit_data["sub_commits"][-1]
+            if self.storage.check_commit_exists(last_sub):
+                commit_data = self.storage.load_commit(last_sub)
+                hash = last_sub
+
+        flat_tensors = self._fetch_tensors(hash)
+        self._restore_commit_data(commit_data, flat_tensors)
 ```
+
+`load()` transparently resolves Mega-Hash commits to their last real sub-commit. This means you can safely call `ckpt.load("mega_xxxx")` or `ckpt.goto("mega_xxxx")` — the actual weights are loaded from the final epoch checkpoint embedded inside.
 
 `_fetch_tensors()` is a recursive delta resolver:
 
@@ -542,7 +578,78 @@ Reconstruct the nested state dicts from the JSON structure + flat tensors, then 
                 else:
                     set_rng_state(rng_state)
 ```
-**DDP-aware RNG restoration.** The saved `rng` is a list `[rank0_state, rank1_state, ...]`. Each rank restores **its own** RNG state — Rank 2 restores `rng_state[2]`, not `rng_state[0]`. This ensures each GPU's dropout masks, data augmentation, etc., resume from exactly where they left off.
+**DDP-aware RNG restoration.** The saved `rng` is a list `[rank0_state, rank1_state, ...]`. Each rank restores **its own** RNG state — Rank 2 restores `rng_state[2]`, not `rng_state[0]`### `__enter__` — Run Mode Dispatch
+
+```python
+    def __enter__(self) -> "CheckpointManager":
+        self._lock_acquire()
+        self._session_commits = []
+
+        if self.run_mode == "overwrite":
+            self.storage.delete_ref(self._current_branch)
+            self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
+
+        elif self.run_mode == "new_branch":
+            existing = self.storage.read_ref(self._current_branch)
+            if existing:
+                try:
+                    self.load(existing)  # warm-start weights from last run
+                except Exception as e:
+                    logger.warning(f"Could not pre-load state: {e}")
+            # Reset counters — new_branch is a fresh run, not a continuation
+            self._epoch = 0
+            self._step  = 0
+            self._batch_idx = 0
+            new_branch_name = f"{base}_continue_{uuid.uuid4().hex[:4]}"
+            self._current_branch = new_branch_name
+            self.storage.write_head(new_branch_name)
+            self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
+
+        else:  # append
+            if self.auto_resume:
+                latest = self.storage.read_ref(self._current_branch)
+                if latest and self.storage.check_commit_exists(latest):
+                    try:
+                        self.load(latest)
+                    except Exception as e:
+                        logger.warning(f"Failed to resume: {e}")
+            if self._hash is None:
+                self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
+
+        return self
+```
+
+**`new_branch` always resets `_epoch`, `_step`, `_batch_idx` to 0** even if weights are loaded from a prior checkpoint. This is because `new_branch` is a *fresh experiment*, not a continuation — `ckpt.loop(epochs=50)` should always yield epochs 0–49 regardless of what the prior branch achieved.
+
+### `__exit__` — Cleanup Without Implicit Save
+
+```python
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is not None:
+                self.save(message=f"[FAILED] ❌ {exc_type.__name__}")
+        except Exception as e:
+            logger.warning(f"Failed to save on exit: {e}")
+        finally:
+            # group_commits is already called by loop()'s finally block.
+            # Only invoke here if the user saved manually without ckpt.loop().
+            if self._session_commits:
+                self.group_commits(message="Training Loop Mega-Hash")
+            # Join all pending async workers before printing so the tree is fully populated.
+            for p in self._bg_processes:
+                p.join(timeout=120)
+            self._bg_processes.clear()
+            self._lock_release()
+            self.print_tree()
+        return False
+```
+
+Key changes from earlier versions:
+- **No implicit `self.save()` on clean exit** — `loop()`'s `finally` block already handles grouping. An extra save after a Mega-Hash was written would cause async worker crashes.
+- **Workers are joined** before `print_tree()` so the tree is fully populated when displayed.
 
 ```python
         if "deterministic" in metadata:
@@ -699,19 +806,31 @@ Increment the global step counter. Call this after each gradient update to keep 
 ```python
     def loop(self, epochs: int, steps_per_epoch: Optional[int] = None):
         start = self._epoch
-        for ep in range(start, epochs):
-            self._epoch = ep
-            if steps_per_epoch is None:
-                yield ep
-            else:
-                for st in range(steps_per_epoch):
-                    self._step = ep * steps_per_epoch + st
-                    yield ep, st
-            if self.auto_resume:
-                self.save()
+        self._session_start_hash = self._hash
+        self._session_commits = []
+        try:
+            for ep in range(start, epochs):
+                self._epoch = ep
+                if steps_per_epoch is None:
+                    yield ep
+                else:
+                    for st in range(steps_per_epoch):
+                        self._step = ep * steps_per_epoch + st
+                        yield ep, st
+        finally:
+            # Join background workers BEFORE group_commits.
+            # Workers write the branch ref to the last sub-commit hash.
+            # We must let them finish first, then overwrite that ref with the Mega-Hash.
+            for p in self._bg_processes:
+                p.join(timeout=120)
+            self._bg_processes.clear()
+            if self._session_commits:
+                self.group_commits(message=f"Loop Mega-Hash ({epochs} epochs)")
 ```
 
-A generator that yields epoch numbers (or `(epoch, step)` tuples) starting from the last saved epoch. If `auto_resume=True`, it auto-saves at the end of each epoch. This means re-running the script after a crash will resume from the correct epoch automatically.
+A generator that yields epoch numbers starting from `self._epoch` (which is 0 in `new_branch` mode, or the last saved epoch in `append` mode). The `finally` block runs when the `for epoch in ckpt.loop()` iteration completes (or if interrupted by an exception).
+
+> **Why workers are joined here, not in `__exit__`:** The `finally` in `loop()` runs while we're still inside the `with` block, before `__exit__` fires. Joining here ensures all `.safetensors` and `.json` files are on disk before `group_commits` writes the Mega-Hash as the branch tip.
 
 ### `load_into_*` Methods
 
@@ -733,3 +852,98 @@ def create_checkpoint(dirpath: Union[str, Path], **kwargs) -> CheckpointManager:
 ```
 
 A module-level convenience factory function.
+
+---
+
+## 10. Mega-Hash Squashing
+
+At the end of every `ckpt.loop()` call (or `__exit__` for manual saves), `group_commits()` is invoked to squash all session commits into a single **Mega-Hash** commit:
+
+```python
+def group_commits(self, message: str = "Mega-Hash"):
+    if not self._session_commits or len(self._session_commits) <= 1:
+        return
+
+    mega_hash = f"mega_{uuid.uuid4().hex[:8]}"
+    last_data = self._commits[self._session_commits[-1]]
+
+    mega_commit_data = {
+        "hash": mega_hash,
+        "parent": self._session_start_hash,
+        "is_mega": True,
+        "sub_commits": self._session_commits,
+        "message": message,
+        "step": self._step,
+        "epoch": self._epoch,
+        "metric": last_data.metric,
+        "components_structure": last_data.components_structure or {},
+        "rng": last_data.rng,
+        "deterministic": last_data.deterministic
+    }
+
+    self.storage.save_commit(mega_hash, mega_commit_data)
+    self.storage.write_ref(self._current_branch, mega_hash)
+    self.storage.write_head(self._current_branch)
+```
+
+### What is a Mega-Hash commit?
+
+A Mega-Hash is a commit JSON file with `"is_mega": true` and a `"sub_commits"` list. It has **no corresponding `.safetensors` blob** — it is a pure metadata container.
+
+When you call `ckpt.load("mega_xxxx")` or `ckpt.goto("mega_xxxx")`, `syckpt` transparently resolves to `sub_commits[-1]` (the last real sub-commit) and loads tensors from there.
+
+### LSH prefix clustering and Mega-Hash identity
+
+Each epoch's LSH hash is derived from your model architecture + hyperparameter config. Since these don't change between epochs of the same run, **all sub-commits share the same 8-character LSH prefix**:
+
+```
+9af15b33        ← epoch 0 (first save, no collision)
+9af15b33-24c3f9 ← epoch 1 (collision-resolved)
+9af15b33-a03e0c ← epoch 2 (collision-resolved)
+```
+
+This shared prefix is a natural fingerprint of the experiment. Any two runs with different hyperparameters (different learning rate, different model size) will produce hashes with **different prefixes**, making the tree immediately scannable without reading commit messages.
+
+### `print_tree` rendering
+
+Mega-Hash commits are rendered with their sub-commits nested inline:
+
+```
+--- Syckpt Tree ---
+├── mega_9b2 (main_continue_3d32): [MEGA-HASH] 3 sub-commits | Loop Mega-Hash (3 epochs) [Epoch 2]
+│   ├── 9af15b33: epoch-0 [Epoch 0]
+│   ├── 9af15b33-24c3f9: epoch-1 [Epoch 1]
+│   └── 9af15b33-e390dc: epoch-2 [Epoch 2]
+└── mega_4ae (HEAD, *main_continue_64e2*): [MEGA-HASH] 3 sub-commits | Loop Mega-Hash (3 epochs) [Epoch 2]
+    └── ...
+```
+
+Sub-commits are **excluded from top-level tree roots** (they don't appear as independent nodes), keeping the view clean regardless of how many epochs you train.
+
+---
+
+## 11. Future: Hierarchical Mega-Hashes
+
+The current Mega-Hash system is **single-level**: one Mega-Hash wraps all epoch commits from one run. As training scales to foundational models spanning months, the true evolution is **Hierarchical Mega-Hashes** — nesting Mega-Hashes inside larger Mega-Hashes:
+
+1. **Epoch Mega-Hashes**: Squash 10,000 granular gradient-step checkpoints into a single `Epoch-1` node.
+2. **Phase Mega-Hashes**: Squash 100 `Epoch-X` epochs into a `Warmup-Phase` or `Cooldown-Phase` node.
+3. **Experiment Mega-Hashes**: Combine multiple parallel phases into a single `Run-V2` root.
+
+```
+--- Syckpt Tree ---
+└── mega_run_v2 (HEAD, *main*) [MEGA-HASH]
+    ├── mega_warmup [MEGA-HASH]
+    │   ├── mega_epoch_1 [MEGA-HASH]
+    │   │   ├── 1a2b3c4d [Step 100]
+    │   │   ├── ...
+    ...
+```
+
+Instead of flat lists, Hierarchical Mega-Hashes will contain **DAGs of sub-mega-hashes**, providing infinite zoom-in/zoom-out capability for deep training histories without losing step-level rewindability.
+
+This requires:
+- An interactive tree visualization engine beyond terminal output.
+- A lazy tensor-fetching strategy for recursive delta resolution across nested trees.
+
+Targeted for `v2.0`.

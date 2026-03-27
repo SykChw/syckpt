@@ -186,6 +186,7 @@ class CheckpointManager:
         "_session_start_hash",
         "_top_k_metrics",
         "run_mode",
+        "_bg_processes",
     )
 
     def __init__(
@@ -229,12 +230,19 @@ class CheckpointManager:
         self._session_commits: List[str] = []
         self._session_start_hash: Optional[str] = None
         self._top_k_metrics: List[Tuple[float, str]] = []
+        self._bg_processes: list = []
 
-        # Load latest commit from the active branch if it exists
+        # Load latest commit from the active branch if it exists.
+        # Skip mega-hash tips — they have no tensor blob and exist only as UI containers.
         branch_hash = self.storage.read_ref(self._current_branch)
-        if branch_hash:
+        if branch_hash and self.storage.check_commit_exists(branch_hash):
             self._hash = branch_hash
-            self._load_commit_into_cache(branch_hash)
+            try:
+                data = self.storage.load_commit(branch_hash)
+                if not data.get("is_mega"):
+                    self._load_commit_into_cache(branch_hash)
+            except Exception:
+                pass
 
     # Properties
     @property
@@ -622,9 +630,15 @@ class CheckpointManager:
             base_hash = self._hash
             
             # Anti-Collision: LSH will output identical hashes for minor delta patches!
-            if base_hash and current_hash == base_hash:
+            base_c_hash = current_hash
+            while self.storage.check_commit_exists(current_hash) or current_hash in self._commits:
                 import uuid
-                current_hash = f"{current_hash}-{uuid.uuid4().hex[:6]}"
+                current_hash = f"{base_c_hash}-{uuid.uuid4().hex[:6]}"
+
+            # If base_hash is the same as (or not yet a committed) current_hash, treat as root.
+            # This happens for the very first save where __enter__ sets _hash = generated hash.
+            if base_hash == current_hash or not self.storage.check_commit_exists(base_hash):
+                base_hash = None
                 
             metadata, flat_tensors = self._build_commit_data()
             
@@ -652,9 +666,13 @@ class CheckpointManager:
                 logger.info(f"Async Save Started [PID: {os.getpid()}] processing blob {c_hash}")
                 b_tensors = None
                 if b_hash and fs_storage.check_commit_exists(b_hash):
-                    # In true production, this load should ideally be cached across the RAM barrier
-                    # but for total isolation safety, the child loads the base itself.
-                    b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
+                    # Skip mega-hash commits — they are UI containers with no tensor blob.
+                    try:
+                        b_meta = fs_storage.load_commit(b_hash)
+                        if not b_meta.get("is_mega"):
+                            b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
+                    except Exception:
+                        b_tensors = None
 
                 blob_meta = fs_storage.save_tensors(comp_tensors, c_hash, base_tensors=b_tensors)
                 c_data["blob_metadata"] = blob_meta
@@ -670,6 +688,7 @@ class CheckpointManager:
                 args=(cpu_tensors, current_hash, base_hash, commit_data, self._current_branch, self.storage)
             )
             p.start()
+            self._bg_processes.append(p)
 
             # We locally update the host references instantly without waiting for the disk write!
             self._hash = current_hash
@@ -702,6 +721,15 @@ class CheckpointManager:
                 raise ValueError(f"Commit not found: {hash}")
 
             commit_data = self.storage.load_commit(hash)
+
+            # Mega-hash commits are UI grouping containers with no tensor blob.
+            # Transparently resolve to the last real sub-commit.
+            if commit_data.get("is_mega") and commit_data.get("sub_commits"):
+                last_sub = commit_data["sub_commits"][-1]
+                if self.storage.check_commit_exists(last_sub):
+                    commit_data = self.storage.load_commit(last_sub)
+                    hash = last_sub
+
             flat_tensors = self._fetch_tensors(hash)
             self._restore_commit_data(commit_data, flat_tensors)
 
@@ -714,6 +742,7 @@ class CheckpointManager:
             }
         finally:
             self._lock_release()
+
 
     # load_into_* functions
     def load_into_model(self, model: nn.Module, hash: Optional[str] = None) -> None:
@@ -860,11 +889,16 @@ class CheckpointManager:
                     for st in range(steps_per_epoch):
                         self._step = ep * steps_per_epoch + st
                         yield ep, st
-                if self.auto_resume:
-                    self.save()
         finally:
+            # Wait for all pending async workers before grouping \u2014 workers write the branch ref to
+            # the individual sub-commit hash, so we must let them finish FIRST, then overwrite
+            # that ref with the mega-hash.
+            for p in self._bg_processes:
+                p.join(timeout=120)
+            self._bg_processes.clear()
             if self._session_commits:
                 self.group_commits(message=f"Loop Mega-Hash ({epochs} epochs)")
+
 
     def list_checkpoints(self) -> Dict[str, str]:
         # Without branches folder per commit, we just list the branch tip commits
@@ -880,45 +914,51 @@ class CheckpointManager:
         self._lock_acquire()
 
         self._session_commits = []
-        self._session_start_hash = self._hash
 
-        if self.auto_resume:
-            latest = self.storage.read_ref(self._current_branch)
-            if latest and self.storage.check_commit_exists(latest):
-                
-                if self.run_mode == "overwrite":
-                    # Start fresh
-                    self.storage.delete_ref(self._current_branch)
-                    self._hash = self._generate_hash()
-                    logger.info(f"Overwrote branch {self._current_branch}, starting fresh with {self._hash}")
-                    self._session_start_hash = self._hash
+        if self.run_mode == "overwrite":
+            # Delete current branch tip and start a completely fresh run on the same branch.
+            self.storage.delete_ref(self._current_branch)
+            self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
+            logger.info(f"Overwrote branch {self._current_branch}, starting fresh.")
 
-                elif self.run_mode == "append":
+        elif self.run_mode == "new_branch":
+            # Always fork a new branch so each run is completely independent.
+            existing = self.storage.read_ref(self._current_branch)
+            if existing:
+                # Pre-load model weights from the last checkpoint so the new branch
+                # starts with trained weights. Reset counters since this is a fresh run.
+                try:
+                    self.load(existing)
+                except Exception as e:
+                    logger.warning(f"Could not pre-load state from {existing}: {e}")
+            # Reset epoch/step \u2014 new_branch is a fresh run, not a continuation.
+            self._epoch = 0
+            self._step = 0
+            self._batch_idx = 0
+            import uuid
+            base = self._current_branch.split("_continue_")[0]
+            new_branch_name = f"{base}_continue_{uuid.uuid4().hex[:4]}"
+            self._current_branch = new_branch_name
+            self.storage.write_head(new_branch_name)
+            self._hash = self._generate_hash()
+            self._session_start_hash = self._hash
+            logger.info(f"Created new branch {new_branch_name} for this run.")
+
+        else:  # append
+            if self.auto_resume:
+                latest = self.storage.read_ref(self._current_branch)
+                if latest and self.storage.check_commit_exists(latest):
                     try:
                         self.load(latest)
                         logger.info(
-                            f"Resumed from step {self._step}, batch {self._batch_idx} on branch {self._current_branch}"
+                            f"Resumed from step {self._step}, batch {self._batch_idx} "
+                            f"on branch {self._current_branch}"
                         )
                     except Exception as e:
                         logger.warning(f"Failed to resume from {latest}: {e}")
-                else: # new_branch
-                    try:
-                        self.load(latest)
-                        import uuid
-                        new_branch_name = f"{self._current_branch}_continue_{uuid.uuid4().hex[:4]}"
-                        self._current_branch = new_branch_name
-                        self.storage.write_head(new_branch_name)
-                        self.storage.write_ref(new_branch_name, latest)
-                        logger.info(f"Created new branch {new_branch_name} for additive training")
-                    except Exception as e:
-                        logger.warning(f"Failed to resume from {latest}: {e}")
-            else:
-                # Need initial save
+            if self._hash is None:
                 self._hash = self._generate_hash()
-                logger.info(f"Initialized new branch {self._current_branch} with {self._hash}")
-                self._session_start_hash = self._hash
-        else:
-            self._hash = self._generate_hash()
             self._session_start_hash = self._hash
 
         return self
@@ -931,7 +971,14 @@ class CheckpointManager:
         except Exception as e:
             logger.warning(f"Failed to save on exit: {e}")
         finally:
-            self.group_commits(message="Training Loop Mega-Hash")
+            # NOTE: group_commits is already called by loop()'s finally block.
+            # Only call it here if the user is NOT using ckpt.loop() (i.e. manual saves).
+            if self._session_commits:
+                self.group_commits(message="Training Loop Mega-Hash")
+            # Wait for all async save workers to flush to disk before printing.
+            for p in self._bg_processes:
+                p.join(timeout=120)
+            self._bg_processes.clear()
             self._lock_release()
             self.print_tree()
         return False
@@ -983,62 +1030,76 @@ class CheckpointManager:
             
         commits = tree_data["commits"]
         branch_tips = tree_data["branch_tips"]
-        
-        children = {}
-        for h in commits.keys():
-            children[h] = []
-            
-        roots = []
+        tags = tree_data.get("tags", {})
+
+        # Collect all sub-commit hashes so we can hide them from the top-level view.
+        # They will be shown inline under their parent mega-hash.
+        sub_commit_set: set = set()
         for h, c in commits.items():
+            if c.get("is_mega"):
+                sub_commit_set.update(c.get("sub_commits", []))
+
+        # Build parent → children map (excluding sub-commits from tree hierarchy)
+        top_commits = {h: c for h, c in commits.items() if h not in sub_commit_set}
+        children: dict = {h: [] for h in top_commits}
+
+        roots = []
+        for h, c in top_commits.items():
             p = c.get("parent")
-            if p and p in commits:
-                children[p].append(h)
-            else:
+            if not p or p not in top_commits or p == h:
                 roots.append(h)
-                
+            else:
+                children[p].append(h)
+
         def _print_node(node_hash, prefix="", is_last=True):
-            c = commits[node_hash]
-            
+            c = top_commits[node_hash]
+
             is_mega = c.get("is_mega")
             if is_mega:
-                msg = f"[MEGA-HASH] {len(c.get('sub_commits', []))} sub-commits ({c.get('message', '')})"
+                sub_list = c.get("sub_commits", [])
+                msg = f"[MEGA-HASH] {len(sub_list)} sub-commits | {c.get('message', '')}"
             else:
                 msg = c.get("message", "")
-                
+
             epoch = c.get("epoch", 0)
             metric = c.get("metric")
             metric_str = f" | metric: {metric:.4f}" if metric is not None else ""
-            
+
             labels = []
             if node_hash == self._hash:
                 labels.append("HEAD")
             for b, tip in branch_tips.items():
                 if tip == node_hash:
-                    if b == self._current_branch:
-                        labels.append(f"*{b}*")
-                    else:
-                        labels.append(b)
-                        
-            # Map tags
-            tags = tree_data.get("tags", {})
+                    labels.append(f"*{b}*" if b == self._current_branch else b)
             for t_name, t_val in tags.items():
                 if t_val == node_hash:
                     labels.append(f"[TAG: {t_name}]")
-                        
+
             label_str = f" ({', '.join(labels)})" if labels else ""
             connector = "└── " if is_last else "├── "
-            
             print(f"{prefix}{connector}{node_hash[:8]}{label_str}: {msg} [Epoch {epoch}]{metric_str}")
-            
+
+            # If this is a mega-hash, list sub-commits inline with indentation
+            if is_mega:
+                sub_list = c.get("sub_commits", [])
+                sub_prefix = prefix + ("    " if is_last else "│   ")
+                for j, sub in enumerate(sub_list):
+                    sub_c = commits.get(sub, {})
+                    sub_msg = sub_c.get("message", "")
+                    sub_ep = sub_c.get("epoch", "?")
+                    sub_connector = "└── " if j == len(sub_list) - 1 else "├── "
+                    print(f"{sub_prefix}{sub_connector}{sub[:8]}: {sub_msg} [Epoch {sub_ep}]")
+
             child_list = children.get(node_hash, [])
             for i, child in enumerate(child_list):
                 extension = "    " if is_last else "│   "
                 _print_node(child, prefix + extension, i == len(child_list) - 1)
-                
+
         print(f"\n--- Syckpt Tree [{'LOCAL' if not self._lock else 'DIST'}] ---")
         for i, r in enumerate(roots):
             _print_node(r, "", i == len(roots) - 1)
         print("----------------------\n")
+
 
 
 def create_checkpoint(dirpath: Union[str, Path], **kwargs) -> CheckpointManager:
