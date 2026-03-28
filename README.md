@@ -157,17 +157,20 @@ with CheckpointManager("./my_experiment", max_to_keep=5) as ckpt:
 
 ```
 my_experiment/.syckpt/
-├── HEAD                        # "ref: refs/heads/main"
+├── HEAD                        # "ref: refs/heads/main_continue_a1b2"
 ├── objects/
-│   ├── <hash_epoch0>.json      # Full base commit
-│   ├── <hash_epoch0>.safetensors
-│   ├── <hash_epoch1>.json      # Delta commit (parent → epoch0)
-│   ├── <hash_epoch1>.safetensors  # Only stores ΔW, not the full weights
-│   ├── <hash_epoch2>.json      # Delta commit (parent → epoch1)
-│   └── <hash_epoch2>.safetensors
+│   ├── 9af15b33.json           # epoch 0: full base commit
+│   ├── 9af15b33.safetensors
+│   ├── 9af15b33-24c3f9.json    # epoch 1: delta commit (ΔW only)
+│   ├── 9af15b33-24c3f9.safetensors
+│   ├── 9af15b33-a03e0c.json    # epoch 2: delta commit
+│   ├── 9af15b33-a03e0c.safetensors
+│   └── mega_b7c2d1e4.json      # Mega-Hash: groups all 3 epochs (no blob)
 └── refs/heads/
-    └── main                    # Points to <hash_epoch2>
+    └── main_continue_a1b2      # Points to mega_b7c2d1e4
 ```
+
+> All sub-commits share the LSH prefix `9af15b33` — a natural fingerprint of this model+config combination. Collision-resolved suffixes (`-24c3f9`, `-a03e0c`) keep each epoch individually addressable.
 
 ### Resuming After a Crash
 
@@ -194,67 +197,120 @@ ckpt.goto("lr_sweep_high")
 ```
 This is incredibly useful for **hyperparameter sweeps**. You can easily explore, back up, and branch off historical checkpoints with $O(1)$ time and space cost!
 
-### Case Studies: Controlling the Context Manager Loop
+### Controlling the Training Loop with `run_mode`
 
-When you re-run a training loop, you might want to start fresh or keep appending. The Context Manager accepts a `run_mode` flag to give you absolute control over the Git tree:
+When you re-run a training script, `run_mode` controls what happens with the existing history:
 
-#### Case 1: Additive Training on a New Branch (Recommended)
-You ran 50 epochs, stopped, and want to resume training for 50 more epochs, but you want to keep the original 50-epoch branch clean.
+#### `run_mode="new_branch"` (default)
+
+Forkes a new branch every time. Each run is completely independent. **Weights are warm-started from the previous run's last checkpoint**, but counters reset to 0, so `ckpt.loop(epochs=50)` always yields epochs 0–49.
+
 ```python
-# `run_mode="new_branch"` loads the latest commit, but immediately creates 
-# a new branch (e.g., `main_continue_a1b2`) and saves the new epochs there.
-with CheckpointManager("./my_experiment", run_mode="new_branch") as ckpt:
-    # training loop...
+# Run 1 → commits to branch: main_continue_a1b2, shows mega_xxx
+with CheckpointManager("./my_experiment") as ckpt:
+    ckpt.model = model
+    for epoch in ckpt.loop(epochs=50):
+        ckpt.save(metric=val_loss)
+
+# Run 2 → forks to branch: main_continue_c3d4, independent mega_yyy
+with CheckpointManager("./my_experiment") as ckpt:
+    ckpt.model = model
+    for epoch in ckpt.loop(epochs=50):  # always yields 0–49
+        ckpt.save(metric=val_loss)
 ```
 
-#### Case 2: Overwriting a Failed/Redundant Run
-You messed up your hyperparameters or realized the current branch is a dead end. You want to start completely fresh and wipe the current branch's history.
+Perfect for **hyperparameter sweeps** — run the same script with different configs, each run gets its own branch:
+
 ```python
-# `run_mode="overwrite"` starts from scratch.
-# By default, it forcefuly purges the branch and starts anew.
+for lr in [1e-3, 3e-4, 1e-4]:
+    with CheckpointManager("./sweep", run_mode="new_branch",
+                           max_to_keep=3, maximize=False) as ckpt:
+        ckpt.model = build_model()
+        ckpt.optimizer = torch.optim.Adam(ckpt.model.parameters(), lr=lr)
+        ckpt.config = {"lr": lr}
+        for epoch in ckpt.loop(epochs=50):
+            ckpt.save(metric=val_loss)
+
+# After the sweep: print_tree shows one mega-hash per lr value,
+# best_1/best_2/best_3 tags point to the globally best checkpoints.
+```
+
+#### `run_mode="append"`
+
+Continues the current branch from the last checkpoint:
+
+```python
+# First run: epochs 0–49
+with CheckpointManager("./my_experiment", run_mode="append") as ckpt:
+    for epoch in ckpt.loop(epochs=50):
+        ckpt.save(metric=val_loss)
+
+# Second run: resumes from epoch 49, continues to epoch 99
+with CheckpointManager("./my_experiment", run_mode="append") as ckpt:
+    for epoch in ckpt.loop(epochs=100):
+        ckpt.save(metric=val_loss)
+```
+
+#### `run_mode="overwrite"`
+
+Wipes the current branch and starts completely fresh. Use when you want a clean slate:
+
+```python
 with CheckpointManager("./my_experiment", run_mode="overwrite") as ckpt:
-    # training loop...
+    for epoch in ckpt.loop(epochs=50):
+        ckpt.save(metric=val_loss)
 ```
 
-#### Case 3: Manual Control (Without Context Manager)
-If you prefer precise control over when saves happen, bypass the `with` block:
-```python
-ckpt = CheckpointManager("./my_experiment", auto_resume=True)
-ckpt.model = model
-# ...
-if ckpt.auto_resume:
-    latest = ckpt.storage.read_ref(ckpt._current_branch)
-    if latest: ckpt.load(latest)
+#### Manual control (without context manager)
 
-for epoch in range(ckpt.epoch, 100):
+```python
+ckpt = CheckpointManager("./my_experiment", auto_resume=False)
+ckpt.model = model
+for epoch in range(50):
+    ckpt._epoch = epoch
     # train...
     if epoch % 10 == 0:
         ckpt.save(message=f"manual save epoch {epoch}")
+ckpt.group_commits(message="manual run")
+ckpt.print_tree()
 ```
 
-### Branching Experiments
+### Mega-Hash Tree View
+
+Upon exiting the context manager, `syckpt` prints the full commit tree. After 2 runs with `run_mode="new_branch"`:
+
+```
+--- Syckpt Tree ---
+├── mega_9b2 (main_continue_a1b2): [MEGA-HASH] 50 sub-commits | Loop Mega-Hash (50 epochs) [Epoch 49]
+│   ├── 9af15b33: epoch-0 [Epoch 0]
+│   ├── 9af15b33-24c3f9: epoch-1 [Epoch 1]
+│   └── ... (48 more)
+└── mega_4ae (HEAD, *main_continue_c3d4*): [MEGA-HASH] 50 sub-commits | Loop Mega-Hash (50 epochs) [Epoch 49]
+    └── ...
+```
+
+Each branch tip is a Mega-Hash. Each Mega-Hash contains the full epoch history nested inside, keeping the top-level view clean.
+
+### Branching and Navigation
 
 ```python
 ckpt = CheckpointManager("./my_experiment")
 ckpt.model = model
 ckpt.optimizer = optimizer
 
-# Create a named branch for a hyperparameter sweep
-ckpt.create_branch("lr_sweep_high")
+# Jump to any epoch hash or branch name
+ckpt.goto("9af15b33-24c3f9")         # restore exact epoch 1 weights
+ckpt.goto("main_continue_a1b2")       # restore branch tip
 
-# Change hyperparameters
+# Create a named branch for a specific experiment
+ckpt.create_branch("lr_sweep_high")
 for pg in optimizer.param_groups:
     pg["lr"] = 5e-3
-
-# Train on this branch...
 for epoch in ckpt.loop(epochs=5):
-    # ...
     ckpt.save(message=f"lr=5e-3 epoch {epoch}")
 
-# Switch back to main
+# Switch back and export
 ckpt.checkout_branch("main")
-
-# Export any commit to a standard PyTorch .ckpt for deployment
 ckpt.export_ckpt("lr_sweep_high", "./deploy/model_best.ckpt")
 ```
 
@@ -377,11 +433,10 @@ For complete line-by-line code walkthroughs, mathematical proofs, and architectu
 
 *   **[Implementation Overview](docs/implementation.md)** — Architecture map, module dependencies, and end-to-end data flow.
 *   **[Storage & CAS](docs/storage_and_cas.md)** — Git work-trees, Merkle DAGs, `flatten_state`/`unflatten_state`, delta arithmetic.
-*   **[Manager & DDP](docs/manager_and_ddp.md)** — Distributed training synchronization, async multiprocessing saves.
+*   **[Manager & DDP](docs/manager_and_ddp.md)** — Distributed training synchronization, async multiprocessing saves, Mega-Hash squashing, and future hierarchical roadmap.
 *   **[Dataloader & Resumption](docs/dataloader_and_resumption.md)** — Catastrophic forgetting, `StatefulRandomSampler` line-by-line.
-*   **[Usage Guide](docs/usage.md)** — Branching, Mega-Hashes, and Tree Navigation.
+*   **[Usage Guide](docs/usage.md)** — Run modes, Mega-Hashes, hyperparameter sweeps, Best-K, tree navigation.
 *   **[File Formats](docs/file_formats.md)** — Precision handling, CAS formats, and custom storage engines.
-*   **[Future Outlook](docs/future.md)** — Hierarchical Mega-Hashes for massive experiments.
 
 ---
 

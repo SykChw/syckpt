@@ -187,6 +187,7 @@ class CheckpointManager:
         "_top_k_metrics",
         "run_mode",
         "_bg_processes",
+        "_session_stack",
     )
 
     def __init__(
@@ -231,6 +232,8 @@ class CheckpointManager:
         self._session_start_hash: Optional[str] = None
         self._top_k_metrics: List[Tuple[float, str]] = []
         self._bg_processes: list = []
+        # Stack of {start_hash, commits} frames for nested loop() calls
+        self._session_stack: list = []
 
         # Load latest commit from the active branch if it exists.
         # Skip mega-hash tips — they have no tensor blob and exist only as UI containers.
@@ -563,14 +566,14 @@ class CheckpointManager:
         c2_config = c2_data.get("config", {})
 
         all_keys = set(c1_config.keys()) | set(c2_config.keys())
-        diff = {"hash1": hash1[:8], "hash2": hash2[:8], "config_diff": {}}
+        config_diff: dict = {}
         for k in all_keys:
             if c1_config.get(k) != c2_config.get(k):
-                diff["config_diff"][k] = {
+                config_diff[k] = {
                     "v1": c1_config.get(k),
                     "v2": c2_config.get(k),
                 }
-        return diff
+        return {"hash1": hash1[:8], "hash2": hash2[:8], "config_diff": config_diff}
 
     # Save/Load - utilizing Safetensors & Delta Compression
     def _update_top_k(self, current_hash: str, metric: float):
@@ -722,13 +725,15 @@ class CheckpointManager:
 
             commit_data = self.storage.load_commit(hash)
 
+            # ── Recursively resolve nested Mega-Hashes to a real leaf commit ──
             # Mega-hash commits are UI grouping containers with no tensor blob.
-            # Transparently resolve to the last real sub-commit.
-            if commit_data.get("is_mega") and commit_data.get("sub_commits"):
+            while commit_data.get("is_mega") and commit_data.get("sub_commits"):
                 last_sub = commit_data["sub_commits"][-1]
                 if self.storage.check_commit_exists(last_sub):
                     commit_data = self.storage.load_commit(last_sub)
                     hash = last_sub
+                else:
+                    break
 
             flat_tensors = self._fetch_tensors(hash)
             self._restore_commit_data(commit_data, flat_tensors)
@@ -876,10 +881,30 @@ class CheckpointManager:
     def step_to(self, step: int):
         self._step = step
 
-    def loop(self, epochs: int, steps_per_epoch: Optional[int] = None):
-        start = self._epoch
+    def loop(self, epochs: int, steps_per_epoch: Optional[int] = None, message: Optional[str] = None):
+        """Epoch/step generator with automatic Mega-Hash squashing.
+
+        Supports arbitrary nesting — each call creates a Mega-Hash whose level equals the nesting
+        depth (0 = leaf commits, 1 = mega-of-megas, etc.).  Nested loop() calls naturally build
+        hierarchical Mega-Hash trees without any additional user API.
+
+        Example::
+
+            with CheckpointManager(...) as ckpt:
+                for phase in ckpt.loop(3, message="Experiment"):     # level-1 mega
+                    for epoch in ckpt.loop(50, message="Phase"):     # level-0 mega
+                        ckpt.save(metric=loss)
+        """
+        # ── Push current session frame so the parent collects after we finish ──
+        self._session_stack.append({
+            "start_hash": self._session_start_hash,
+            "commits": list(self._session_commits),
+        })
+        # ── Start a fresh frame for this loop ──
         self._session_start_hash = self._hash
         self._session_commits = []
+
+        start = self._epoch
         try:
             for ep in range(start, epochs):
                 self._epoch = ep
@@ -890,14 +915,26 @@ class CheckpointManager:
                         self._step = ep * steps_per_epoch + st
                         yield ep, st
         finally:
-            # Wait for all pending async workers before grouping \u2014 workers write the branch ref to
-            # the individual sub-commit hash, so we must let them finish FIRST, then overwrite
-            # that ref with the mega-hash.
+            # ── 1. Join background workers BEFORE group_commits ──
+            # Workers write the branch ref to the last sub-commit hash; we must let them
+            # finish first so we can safely overwrite that ref with the Mega-Hash.
             for p in self._bg_processes:
                 p.join(timeout=120)
             self._bg_processes.clear()
-            if self._session_commits:
-                self.group_commits(message=f"Loop Mega-Hash ({epochs} epochs)")
+
+            # ── 2. Level = stack depth before we pop (0-indexed, innermost = 0) ──
+            level = len(self._session_stack) - 1
+            loop_msg = message or f"Loop Mega-Hash (epochs={epochs})"
+            mega = self.group_commits(message=loop_msg, level=level)
+
+            # ── 3. Pop parent frame and resume collecting there ──
+            parent = self._session_stack.pop()
+            self._session_start_hash = parent["start_hash"]
+            self._session_commits = parent["commits"]
+
+            # ── 4. Append this loop's mega-hash to the parent's commit list ──
+            if mega:
+                self._session_commits.append(mega)
 
 
     def list_checkpoints(self) -> Dict[str, str]:
@@ -914,6 +951,8 @@ class CheckpointManager:
         self._lock_acquire()
 
         self._session_commits = []
+        self._session_start_hash = None
+        self._session_stack = []  # reset any leftover stack from a previous `with` block
 
         if self.run_mode == "overwrite":
             # Delete current branch tip and start a completely fresh run on the same branch.
@@ -983,34 +1022,58 @@ class CheckpointManager:
             self.print_tree()
         return False
 
-    def group_commits(self, message: str = "Mega-Hash"):
-        """Clubs recent session commits into a single UI MegaCommit."""
-        if not self._session_commits or len(self._session_commits) <= 1:
-            return
+    def group_commits(self, message: Optional[str] = "Mega-Hash", level: int = 0) -> Optional[str]:
+        """Squashes recent session commits into a single Mega-Hash commit.
+        
+        Args:
+            message: Label stored in the mega-hash JSON.
+            level: Hierarchy depth (0 = leaf-commit group, 1 = mega-of-megas, etc.).
+            
+        Returns:
+            The mega-hash string, or None if nothing was squashed.
+        """
+        if not self._session_commits:
+            return None
+            
+        # At level 0, avoid creating a mega-hash if there's only 1 commit
+        # (prevents useless nesting for single manual saves).
+        # At level > 0, always squash so nested loop structure remains uniform.
+        if level == 0 and len(self._session_commits) <= 1:
+            return None
             
         import uuid
         mega_hash = f"mega_{uuid.uuid4().hex[:8]}"
         last_commit = self._session_commits[-1]
         
-        if last_commit not in self._commits:
-            return
-            
-        last_data = self._commits[last_commit]
+        # Resolve metadata from the last commit (which could itself be a mega-hash)
+        last_data: Optional[Commit] = self._commits.get(last_commit)
+        if last_data is None:
+            try:
+                raw = self.storage.load_commit(last_commit)
+                last_data = Commit.from_dict(raw)
+            except Exception:
+                pass
+                
+        metric = last_data.metric if last_data else None
+        components_structure = (last_data.components_structure or {}) if last_data else {}
+        rng = last_data.rng if last_data else None
+        deterministic = last_data.deterministic if last_data else None
         
         mega_commit_data = {
             "hash": mega_hash,
             "parent": self._session_start_hash,
             "is_mega": True,
-            "sub_commits": self._session_commits,
+            "level": level,
+            "sub_commits": list(self._session_commits),
             "message": message,
             "step": self._step,
             "epoch": self._epoch,
-            "metric": last_data.metric,
+            "metric": metric,
             "config": self._config.to_dict(),
             "timestamp": datetime.now().isoformat(),
-            "components_structure": last_data.components_structure or {},
-            "rng": last_data.rng,
-            "deterministic": last_data.deterministic
+            "components_structure": components_structure,
+            "rng": rng,
+            "deterministic": deterministic
         }
         
         self.storage.save_commit(mega_hash, mega_commit_data)
@@ -1020,6 +1083,8 @@ class CheckpointManager:
         self._hash = mega_hash
         self._commits[mega_hash] = Commit.from_dict(mega_commit_data)
         self._session_commits = []
+        return mega_hash
+
 
     def print_tree(self):
         """Prints the entire commit tree across all branches and highlights the current HEAD."""
@@ -1033,31 +1098,36 @@ class CheckpointManager:
         tags = tree_data.get("tags", {})
 
         # Collect all sub-commit hashes so we can hide them from the top-level view.
-        # They will be shown inline under their parent mega-hash.
+        # They will be shown inline recursively under their parent mega-hash.
         sub_commit_set: set = set()
         for h, c in commits.items():
             if c.get("is_mega"):
                 sub_commit_set.update(c.get("sub_commits", []))
 
-        # Build parent → children map (excluding sub-commits from tree hierarchy)
+        # Build parent → children map (excluding sub-commits from top-level hierarchy)
         top_commits = {h: c for h, c in commits.items() if h not in sub_commit_set}
         children: dict = {h: [] for h in top_commits}
 
         roots = []
         for h, c in top_commits.items():
             p = c.get("parent")
+            # Treat as root if: no parent, parent not in top_commits, or self-referential
             if not p or p not in top_commits or p == h:
                 roots.append(h)
             else:
                 children[p].append(h)
 
         def _print_node(node_hash, prefix="", is_last=True):
-            c = top_commits[node_hash]
+            if node_hash not in commits:
+                return
+            c = commits[node_hash]
 
             is_mega = c.get("is_mega")
             if is_mega:
                 sub_list = c.get("sub_commits", [])
-                msg = f"[MEGA-HASH] {len(sub_list)} sub-commits | {c.get('message', '')}"
+                lvl = c.get("level", 0)
+                msg_text = c.get("message", "")
+                msg = f"[L{lvl} MEGA-HASH] {len(sub_list)} items | {msg_text}"
             else:
                 msg = c.get("message", "")
 
@@ -1079,17 +1149,15 @@ class CheckpointManager:
             connector = "└── " if is_last else "├── "
             print(f"{prefix}{connector}{node_hash[:8]}{label_str}: {msg} [Epoch {epoch}]{metric_str}")
 
-            # If this is a mega-hash, list sub-commits inline with indentation
+            # If this is a mega-hash, list sub-commits recursively inline with indentation
             if is_mega:
                 sub_list = c.get("sub_commits", [])
                 sub_prefix = prefix + ("    " if is_last else "│   ")
                 for j, sub in enumerate(sub_list):
-                    sub_c = commits.get(sub, {})
-                    sub_msg = sub_c.get("message", "")
-                    sub_ep = sub_c.get("epoch", "?")
-                    sub_connector = "└── " if j == len(sub_list) - 1 else "├── "
-                    print(f"{sub_prefix}{sub_connector}{sub[:8]}: {sub_msg} [Epoch {sub_ep}]")
+                    is_last_sub = (j == len(sub_list) - 1)
+                    _print_node(sub, sub_prefix, is_last_sub)
 
+            # Traverse normal DAG children (only applies to top-level nodes)
             child_list = children.get(node_hash, [])
             for i, child in enumerate(child_list):
                 extension = "    " if is_last else "│   "

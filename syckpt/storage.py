@@ -243,14 +243,20 @@ class CASStorage:
                         c_data = self.load_commit(curr)
                         commits[curr] = c_data
                         
-                        # Process sub-commits of MegaHashes so they appear in history!
+                        # Process sub-commits of MegaHashes recursively so they appear in history!
                         if c_data.get("is_mega"):
-                            for sub_hash in c_data.get("sub_commits", []):
-                                try:
-                                    sc_data = self.load_commit(sub_hash)
-                                    commits[sub_hash] = sc_data
-                                except FileNotFoundError:
-                                    pass
+                            to_process: List[str] = list(c_data.get("sub_commits", []))
+                            while to_process:
+                                sub_hash: str = to_process.pop()
+                                if sub_hash not in commits:
+                                    try:
+                                        sc_data = self.load_commit(sub_hash)
+                                        commits[sub_hash] = sc_data
+                                        if sc_data.get("is_mega"):
+                                            # Add nested mega sub-commits to the queue
+                                            to_process.extend(sc_data.get("sub_commits", []))
+                                    except FileNotFoundError:
+                                        pass
                                     
                         curr = c_data.get("parent")
                     except FileNotFoundError:
@@ -285,7 +291,8 @@ class CASStorage:
         try:
             self.fs.get_file(path, tmp_path)
             # Safetensors loads standard dict
-            return load_file(tmp_path)
+            result: Dict[str, torch.Tensor] = load_file(tmp_path)
+            return result
         finally:
             if os.path.exists(tmp_path):
                 os.unlink(tmp_path)

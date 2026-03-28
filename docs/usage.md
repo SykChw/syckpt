@@ -228,6 +228,34 @@ ckpt.load(best_hash)
 
 ---
 
+## Hierarchical Mega-Hashes
+
+For large experiments with multiple phases, you can **nest `ckpt.loop()` calls** to build hierarchical Mega-Hashes. There is zero API overhead — the depth of the Mega-Hash tree automatically matches the depth of your Python `for` loops!
+
+```python
+with CheckpointManager("./my_experiment") as ckpt:
+    # Outer loop: "level 1" mega-hash
+    for phase in ckpt.loop(3, message="Experiment Phase"):
+        
+        # Inner loop: "level 0" mega-hash
+        for epoch in ckpt.loop(50, message=f"Epoch Run"):
+            ckpt.save(metric=loss)
+```
+
+Upon exiting, the tree automatically groups epochs under their respective phases, keeping massive training histories clean and readable:
+
+```
+--- Syckpt Tree ---
+└── mega_08c (HEAD): [L1 MEGA-HASH] 3 items | Experiment Phase [Epoch 49] | metric: 0.2000
+    ├── mega_53e: [L0 MEGA-HASH] 50 items | Epoch Run [Epoch 49] | metric: 0.2000
+    │   ├── 9af15b33: ep-0 [Epoch 0] 
+    │   └── ...
+    ├── mega_c34: [L0 MEGA-HASH] 50 items | Epoch Run [Epoch 49]
+    └── mega_34c: [L0 MEGA-HASH] 50 items | Epoch Run [Epoch 49]
+```
+
+---
+
 ## Context Manager vs. Manual Usage
 
 ### With `ckpt.loop()` (recommended)
