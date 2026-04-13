@@ -173,7 +173,7 @@ class Commit:
             data.get("level", 0),
             data.get("sub_commits", [])
         )
-        c.timestamp = data.get("timestamp", c.timestamp)
+        c.timestamp = data.get("timestamp", datetime.now().isoformat())
         return c
 
 
@@ -959,8 +959,6 @@ class CheckpointManager:
         try:
             for ep in range(start, epochs):
                 self._epoch = ep
-                if steps_per_epoch is None:
-                    yield ep
                 if steps_per_epoch is None:
                     yield ep
                 else:

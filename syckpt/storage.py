@@ -109,6 +109,17 @@ class CASStorage:
         if not self.fs.exists(head_path):
             self.write_head("main")
 
+    def _validate_hash(self, h: str):
+        """Ensures the hash is alphanumeric and prevents directory traversal."""
+        if not h:
+            return
+        # Allow alphanumeric, dashes (for UUID collisions), and underscores
+        import re
+        if not re.match(r"^[a-zA-Z0-9_\-]+$", h):
+            raise ValueError(f"Insecure or invalid hash/ref format: {h}")
+        if ".." in h or "/" in h or "\\" in h:
+            raise ValueError(f"Directory traversal detected in hash: {h}")
+
     def _atomic_write_json(self, data: Any, path: str):
         class TensorEncoder(json.JSONEncoder):
             def default(self, obj):
@@ -152,6 +163,8 @@ class CASStorage:
 
     def write_ref(self, branch_name: str, commit_hash: str):
         """Sets a branch ref to a specific commit hash."""
+        self._validate_hash(branch_name)
+        self._validate_hash(commit_hash)
         ref_path = f"{self.refs_dir}/{branch_name}"
         with self.fs.open(ref_path, "w") as f:
             f.write(commit_hash)
@@ -188,6 +201,7 @@ class CASStorage:
 
     def read_tag(self, tag_name: str) -> Optional[str]:
         """Reads the commit hash for a tag."""
+        self._validate_hash(tag_name)
         tag_path = f"{self.tags_dir}/{tag_name}"
         if not self.fs.exists(tag_path):
             return None
@@ -217,12 +231,14 @@ class CASStorage:
 
     def load_commit(self, commit_hash: str) -> Dict[str, Any]:
         """Loads a commit metadata object."""
+        self._validate_hash(commit_hash)
         commit_path = f"{self.objects_dir}/{commit_hash}.json"
         if not self.fs.exists(commit_path):
             raise FileNotFoundError(f"Commit {commit_hash} not found.")
         return self._read_json(commit_path)
         
     def check_commit_exists(self, commit_hash: str) -> bool:
+        self._validate_hash(commit_hash)
         return self.fs.exists(f"{self.objects_dir}/{commit_hash}.json")
 
     def get_commit_tree(self) -> Dict[str, Any]:
@@ -297,6 +313,7 @@ class CASStorage:
 
     def save_tensors(self, tensors: Dict[str, torch.Tensor], blob_hash: str, base_tensors: Optional[Dict[str, torch.Tensor]] = None) -> Dict[str, Any]:
         """Saves tensors, potentially using delta compression and layer-freezing if a base is provided."""
+        self._validate_hash(blob_hash)
         blob_path = f"{self.objects_dir}/{blob_hash}.safetensors"
         
         metadata = {
@@ -328,6 +345,7 @@ class CASStorage:
         
     def load_tensors(self, blob_hash: str, base_tensors: Optional[Dict[str, torch.Tensor]] = None, is_delta: bool = False, frozen_links: Optional[Dict[str, str]] = None) -> Dict[str, torch.Tensor]:
         """Loads tensors, resolving delta patches and hard-links if necessary."""
+        self._validate_hash(blob_hash)
         blob_path = f"{self.objects_dir}/{blob_hash}.safetensors"
         if not self.fs.exists(blob_path):
             raise FileNotFoundError(f"Blob {blob_hash} not found in CAS storage.")
