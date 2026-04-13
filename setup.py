@@ -12,7 +12,7 @@ long_description = (
 
 setup(
     name="syckpt",
-    version="v0.0.7",
+    version="v0.0.8",
     description="Git-like experiment tracking for deep learning with LSH hashing",
     long_description=long_description,
     long_description_content_type="text/markdown",
