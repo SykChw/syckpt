@@ -440,6 +440,16 @@ For complete line-by-line code walkthroughs, mathematical proofs, and architectu
 
 ---
 
+## Security Notes
+
+> [!CAUTION]
+> **Secret Management**: The `HyperConfig` system (accessed via `ckpt.config`) serializes all data into plain-text JSON files in the `.syckpt/objects/` directory. **Do not store sensitive information like API keys, database credentials, or private tokens in your experiment configuration.**
+
+> [!WARNING]
+> **Exported Checkpoints**: While `syckpt` uses the secure and memory-safe [Safetensors](https://github.com/huggingface/safetensors) format for its internal storage, the `export_ckpt()` utility uses standard `torch.save()` for broad ecosystem compatibility. Standard PyTorch `.ckpt` files use `pickle` and should only be loaded from trusted sources.
+
+---
+
 ## License
 
 MIT
