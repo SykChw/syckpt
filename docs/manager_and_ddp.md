@@ -860,30 +860,34 @@ A module-level convenience factory function.
 At the end of every `ckpt.loop()` call (or `__exit__` for manual saves), `group_commits()` is invoked to squash all session commits into a single **Mega-Hash** commit:
 
 ```python
-def group_commits(self, message: str = "Mega-Hash"):
-    if not self._session_commits or len(self._session_commits) <= 1:
-        return
-
+def group_commits(self, message: Optional[str] = "Mega-Hash", level: int = 0) -> Optional[str]:
+    if not self._session_commits:
+        return None
+        
+    # At level 0, avoid creating a mega-hash if there's only 1 commit
+    if level == 0 and len(self._session_commits) <= 1:
+        return None
+        
     mega_hash = f"mega_{uuid.uuid4().hex[:8]}"
     last_data = self._commits[self._session_commits[-1]]
-
+    
     mega_commit_data = {
         "hash": mega_hash,
         "parent": self._session_start_hash,
         "is_mega": True,
-        "sub_commits": self._session_commits,
+        "level": level,
+        "sub_commits": list(self._session_commits),
         "message": message,
         "step": self._step,
         "epoch": self._epoch,
         "metric": last_data.metric,
-        "components_structure": last_data.components_structure or {},
+        "components_structure": last_data.components_structure,
         "rng": last_data.rng,
         "deterministic": last_data.deterministic
     }
 
     self.storage.save_commit(mega_hash, mega_commit_data)
     self.storage.write_ref(self._current_branch, mega_hash)
-    self.storage.write_head(self._current_branch)
 ```
 
 ### What is a Mega-Hash commit?
@@ -922,28 +926,48 @@ Sub-commits are **excluded from top-level tree roots** (they don't appear as ind
 
 ---
 
-## 11. Future: Hierarchical Mega-Hashes
+## 11. Hierarchical Mega-Hashes via Session Stack
 
-The current Mega-Hash system is **single-level**: one Mega-Hash wraps all epoch commits from one run. As training scales to foundational models spanning months, the true evolution is **Hierarchical Mega-Hashes** — nesting Mega-Hashes inside larger Mega-Hashes:
+The Mega-Hash system manages massive training histories by supporting **$N$-ary trees of Mega-Hashes** for multi-phase experiment tracking.
 
-1. **Epoch Mega-Hashes**: Squash 10,000 granular gradient-step checkpoints into a single `Epoch-1` node.
-2. **Phase Mega-Hashes**: Squash 100 `Epoch-X` epochs into a `Warmup-Phase` or `Cooldown-Phase` node.
-3. **Experiment Mega-Hashes**: Combine multiple parallel phases into a single `Run-V2` root.
+### Conceptual Usage
+
+```python
+with CheckpointManager("./sweep") as ckpt:
+    for lr in ckpt.loop([1e-3, 1e-4], message="LR Sweep"):
+        ckpt._config["lr"] = lr
+        
+        for stage in ckpt.loop(3, message="Curriculum Stage"):
+            # ... update dataloader ...
+            
+            for epoch in ckpt.loop(50, message="Epoch Tuning"):
+                ckpt.save()
+```
+
+### Depth-aware Rendering
 
 ```
---- Syckpt Tree ---
-└── mega_run_v2 (HEAD, *main*) [MEGA-HASH]
-    ├── mega_warmup [MEGA-HASH]
-    │   ├── mega_epoch_1 [MEGA-HASH]
-    │   │   ├── 1a2b3c4d [Step 100]
-    │   │   ├── ...
-    ...
+--- Syckpt Distributed Tree ---
+└── mega_f8a2 (HEAD) [L2 MEGA-HASH] 2 items | LR Sweep
+    ├── mega_1b3c [L1 MEGA-HASH] 3 items | Curriculum Stage (lr=1e-3)
+    │   ├── mega_a12 [L0 MEGA-HASH] 50 items | Epoch Tuning
+    │   │   ├── b2a4: epoch-0
+    │   │   └── ...
+    │   ├── mega_b34
+    │   └── mega_c56
+    └── mega_2d4e [L1 MEGA-HASH] 3 items | Curriculum Stage (lr=1e-4) ...
 ```
 
-Instead of flat lists, Hierarchical Mega-Hashes will contain **DAGs of sub-mega-hashes**, providing infinite zoom-in/zoom-out capability for deep training histories without losing step-level rewindability.
+### Internal Implementation: The Session Stack
 
-This requires:
-- An interactive tree visualization engine beyond terminal output.
-- A lazy tensor-fetching strategy for recursive delta resolution across nested trees.
+This is implemented transparently using a **Session Stack** within `CheckpointManager`:
+1. Every time `ckpt.loop()` is entered, it pushes the current session (list of running commits and the `start_hash`) onto `self._session_stack` and resets the active session to empty.
+2. The user's loop runs, calling `save()` to collect leaf commits in the innermost active session.
+3. When `ckpt.loop()` completes, its `finally` block uses the depth of `_session_stack` as the `level` to squash its active commits into a single Mega-Hash.
+4. It pops the parent session from the stack, and appends the newly created Mega-Hash to the parent's commit list.
 
-Targeted for `v2.0`.
+This guarantees that hierarchical Mega-Hashes perfectly mirror the Python execution stack.
+
+### Resumption via Target Resolution
+
+During resumption via `ckpt.load()`, `syckpt` uses a recursive resolution loop to repeatedly drill down through deep references. This drills down through $N$ levels of UI containers until it hits the final branch leaf that holds the actual tensor blobs.

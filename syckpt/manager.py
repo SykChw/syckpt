@@ -93,7 +93,10 @@ class Commit:
         "blob_metadata",
         "components_structure",
         "rng",
-        "deterministic"
+        "deterministic",
+        "is_mega",
+        "level",
+        "sub_commits"
     )
 
     def __init__(
@@ -110,6 +113,9 @@ class Commit:
         components_structure: Optional[Dict] = None,
         rng: Optional[Any] = None,
         deterministic: Optional[Any] = None,
+        is_mega: bool = False,
+        level: int = 0,
+        sub_commits: Optional[List[str]] = None,
     ):
         self.hash = hash
         self.parent = parent
@@ -124,6 +130,9 @@ class Commit:
         self.components_structure = components_structure
         self.rng = rng
         self.deterministic = deterministic
+        self.is_mega = is_mega
+        self.level = level
+        self.sub_commits = sub_commits or []
 
     def to_dict(self) -> Dict:
         return {
@@ -139,7 +148,10 @@ class Commit:
             "blob_metadata": self.blob_metadata,
             "components_structure": self.components_structure,
             "rng": self.rng,
-            "deterministic": self.deterministic
+            "deterministic": self.deterministic,
+            "is_mega": self.is_mega,
+            "level": self.level,
+            "sub_commits": self.sub_commits
         }
 
     @classmethod
@@ -153,10 +165,13 @@ class Commit:
             data.get("config", {}),
             data.get("metric"),
             data.get("blob_hash"),
-            data.get("blob_metadata", {}),
+            data.get("blob_metadata"),
             data.get("components_structure"),
             data.get("rng"),
-            data.get("deterministic")
+            data.get("deterministic"),
+            data.get("is_mega", False),
+            data.get("level", 0),
+            data.get("sub_commits", [])
         )
         c.timestamp = data.get("timestamp", c.timestamp)
         return c
@@ -188,6 +203,7 @@ class CheckpointManager:
         "run_mode",
         "_bg_processes",
         "_session_stack",
+        "_metric"
     )
 
     def __init__(
@@ -234,6 +250,7 @@ class CheckpointManager:
         self._bg_processes: list = []
         # Stack of {start_hash, commits} frames for nested loop() calls
         self._session_stack: list = []
+        self._metric: float = 0.0
 
         # Load latest commit from the active branch if it exists.
         # Skip mega-hash tips — they have no tensor blob and exist only as UI containers.
@@ -284,6 +301,14 @@ class CheckpointManager:
         self._batch_idx = value
 
     @property
+    def metric(self) -> float:
+        return self._metric
+
+    @metric.setter
+    def metric(self, value: float):
+        self._metric = float(value)
+
+    @property
     def hash(self) -> str:
         return self._hash or "uninitialized"
 
@@ -321,7 +346,8 @@ class CheckpointManager:
             "auto_resume",
             "save_rng",
             "state_manager",
-            "run_mode"
+            "run_mode",
+            "metric"
         ):
             object.__setattr__(self, name, value)
         else:
@@ -370,10 +396,12 @@ class CheckpointManager:
         return metadata, flat_tensors
         
     def _restore_commit_data(self, metadata: Dict[str, Any], flat_tensors: Dict[str, torch.Tensor]):
+        self._hash = metadata.get("hash")
         self._step = metadata.get("step", 0)
         self._epoch = metadata.get("epoch", 0)
         self._batch_idx = metadata.get("batch_idx", 0)
         self._current_branch = metadata.get("branch", "main")
+        self._metric = metadata.get("metric", 0.0)
         
         self._config = HyperConfig.from_dict(metadata.get("config", {}))
         
@@ -638,6 +666,19 @@ class CheckpointManager:
                 import uuid
                 current_hash = f"{base_c_hash}-{uuid.uuid4().hex[:6]}"
 
+            # ── Content-Addressable Blob Hashing ──
+            # We compute a unique hash of the tensors themselves to ensure that 
+            # identical model weights across different branches/commits share the same physical file.
+            def _hash_tensors(tensors: Dict[str, torch.Tensor]) -> str:
+                import hashlib
+                combined = b""
+                for k in sorted(tensors.keys()):
+                    v = tensors[k]
+                    combined += k.encode()
+                    # Use a stable byte representation for the tensor data
+                    combined += v.numpy().tobytes()
+                return hashlib.sha256(combined).hexdigest()[:16]
+
             # If base_hash is the same as (or not yet a committed) current_hash, treat as root.
             # This happens for the very first save where __enter__ sets _hash = generated hash.
             if base_hash == current_hash or not self.storage.check_commit_exists(base_hash):
@@ -648,7 +689,7 @@ class CheckpointManager:
             if self.save_rng:
                 metadata["rng"] = rng_state
 
-            blob_hash = current_hash # using same naming for blob
+            blob_hash = _hash_tensors(flat_tensors)
             commit_data = {
                 "hash": current_hash,
                 "parent": base_hash,
@@ -669,15 +710,25 @@ class CheckpointManager:
                 logger.info(f"Async Save Started [PID: {os.getpid()}] processing blob {c_hash}")
                 b_tensors = None
                 if b_hash and fs_storage.check_commit_exists(b_hash):
-                    # Skip mega-hash commits — they are UI containers with no tensor blob.
+                    # ── Recursively resolve mega-hash parents ──
+                    # If the parent is a Mega-Hash, find the latest real tensor commit within it.
                     try:
-                        b_meta = fs_storage.load_commit(b_hash)
-                        if not b_meta.get("is_mega"):
-                            b_tensors = fs_storage.load_tensors(b_hash, is_delta=False)
-                    except Exception:
+                        curr_b = fs_storage.load_commit(b_hash)
+                        # Resolve mega-hashes down to the last actual commit to find tensors
+                        while isinstance(curr_b, dict) and curr_b.get("is_mega") and curr_b.get("sub_commits"):
+                            last_s = curr_b["sub_commits"][-1]
+                            curr_b = fs_storage.load_commit(last_s)
+                        
+                        if isinstance(curr_b, dict) and not curr_b.get("is_mega"):
+                            base_blob_hash = curr_b.get("blob_hash", curr_b["hash"])
+                            b_tensors = fs_storage.load_tensors(base_blob_hash, is_delta=False)
+                        else:
+                            b_tensors = None
+                    except Exception as e:
+                        logger.warning(f"Could not load base tensors for delta: {e}")
                         b_tensors = None
 
-                blob_meta = fs_storage.save_tensors(comp_tensors, c_hash, base_tensors=b_tensors)
+                blob_meta = fs_storage.save_tensors(comp_tensors, c_data.get("blob_hash", c_hash), base_tensors=b_tensors)
                 c_data["blob_metadata"] = blob_meta
 
                 fs_storage.save_commit(c_hash, c_data)
@@ -910,27 +961,26 @@ class CheckpointManager:
                 self._epoch = ep
                 if steps_per_epoch is None:
                     yield ep
+                if steps_per_epoch is None:
+                    yield ep
                 else:
                     for st in range(steps_per_epoch):
                         self._step = ep * steps_per_epoch + st
                         yield ep, st
         finally:
-            # ── 1. Join background workers BEFORE group_commits ──
+            # ── 2. Join background workers BEFORE group_commits ──
             # Workers write the branch ref to the last sub-commit hash; we must let them
             # finish first so we can safely overwrite that ref with the Mega-Hash.
-            for p in self._bg_processes:
-                p.join(timeout=120)
-            self._bg_processes.clear()
+            self.join()
 
-            # ── 2. Level = stack depth before we pop (0-indexed, innermost = 0) ──
-            level = len(self._session_stack) - 1
+            # ── 3. Calculate level automatically based on children ──
             loop_msg = message or f"Loop Mega-Hash (epochs={epochs})"
-            mega = self.group_commits(message=loop_msg, level=level)
+            mega = self.group_commits(message=loop_msg)
 
-            # ── 3. Pop parent frame and resume collecting there ──
+            # ── 4. Pop parent frame and resume collecting there ──
             parent = self._session_stack.pop()
             self._session_start_hash = parent["start_hash"]
-            self._session_commits = parent["commits"]
+            self._session_commits = list(parent["commits"])
 
             # ── 4. Append this loop's mega-hash to the parent's commit list ──
             if mega:
@@ -1022,7 +1072,14 @@ class CheckpointManager:
             self.print_tree()
         return False
 
-    def group_commits(self, message: Optional[str] = "Mega-Hash", level: int = 0) -> Optional[str]:
+    def join(self, timeout: int = 120):
+        """Waits for all background saving processes to complete."""
+        for p in self._bg_processes:
+            if p.is_alive():
+                p.join(timeout=timeout)
+        self._bg_processes.clear()
+
+    def group_commits(self, message: Optional[str] = "Mega-Hash", level: Optional[int] = None) -> Optional[str]:
         """Squashes recent session commits into a single Mega-Hash commit.
         
         Args:
@@ -1038,6 +1095,29 @@ class CheckpointManager:
         # At level 0, avoid creating a mega-hash if there's only 1 commit
         # (prevents useless nesting for single manual saves).
         # At level > 0, always squash so nested loop structure remains uniform.
+        if level is None:
+            # Automatic level detection based on children
+            max_child_level = -1
+            for h in self._session_commits:
+                c_data = self._commits.get(h)
+                if not c_data:
+                    try:
+                        c_data = self.storage.load_commit(h)
+                    except Exception: continue
+                
+                is_mega = False
+                c_level = 0
+                if isinstance(c_data, dict):
+                    is_mega = c_data.get("is_mega", False)
+                    c_level = c_data.get("level", 0)
+                elif hasattr(c_data, "is_mega"):
+                    is_mega = c_data.is_mega
+                    c_level = getattr(c_data, "level", 0)
+                
+                if is_mega:
+                    max_child_level = max(max_child_level, c_level)
+            level = max_child_level + 1
+
         if level == 0 and len(self._session_commits) <= 1:
             return None
             

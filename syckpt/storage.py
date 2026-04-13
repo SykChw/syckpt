@@ -61,8 +61,6 @@ def compute_delta(current: Dict[str, torch.Tensor], base: Dict[str, torch.Tensor
     delta = {}
     for k, v in current.items():
         if k in base and v.shape == base[k].shape and v.dtype == base[k].dtype:
-            # Check if this entire layer is mathematically identical (e.g. frozen backbone)
-            # torch.equal is extremely fast and prevents saving un-mutated blocks.
             if torch.equal(v, base[k]):
                 delta[k] = {"__frozen__": k}
             else:

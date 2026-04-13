@@ -32,3 +32,8 @@ venv.bak/
 
 # Helper scripts
 release.py
+
+# Tests and Cache
+tests/
+.pytest_cache/
+htmlcov/
